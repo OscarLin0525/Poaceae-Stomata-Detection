@@ -13,6 +13,9 @@
 7. [配置說明](#配置說明)
 8. [訓練指南](#訓練指南)
 9. [自定義擴展](#自定義擴展)
+10. [常見問題](#常見問題)
+11. [⭐ YOLO Student 整合指南](#yolo-student-整合指南)
+12. [⭐ 實作細節與狀態](#實作細節與狀態)
 
 ---
 
@@ -914,12 +917,1401 @@ loss_fn = HungarianMatchingLoss(
 
 ---
 
+## YOLO Student 整合指南
+
+> ⚠️ **實作狀態：規劃中 (Planning Stage)**
+>
+> 本章節為 YOLO 整合的設計規格書，尚未有實際 Python 實作。
+>
+> | 項目 | 狀態 |
+> |------|------|
+> | YOLOOutputWrapper | ❌ 待實作 |
+> | YOLOFeatureAdapter | ❌ 待實作 |
+> | YOLOStudentDetector | ❌ 待實作 |
+>
+> 目前 MTKD 框架已實作的 Student 為 DETR-like 架構（`StudentDetector`）。
+
+本章節說明如何將 YOLO 模型作為 Student 整合到 MTKD 框架中，實現 Feature Alignment 和 Prediction Alignment 的雙重知識蒸餾。
+
+### 整體架構
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Input Image                                     │
+│                                   │                                          │
+│         ┌─────────────────────────┼─────────────────────────┐               │
+│         │                         │                         │               │
+│         ▼                         ▼                         ▼               │
+│  ┌─────────────────┐   ┌─────────────────────────┐  ┌──────────────────┐   │
+│  │  DINO Teacher   │   │    YOLO Student         │  │ Ensemble Teachers│   │
+│  │    (Frozen)     │   │    (Trainable)          │  │    (Frozen)      │   │
+│  │                 │   │                         │  │                  │   │
+│  │ cls_token       │   │  ┌─────────┐            │  │  Teacher1        │   │
+│  │ patch_tokens    │   │  │Backbone │            │  │  Teacher2        │   │
+│  │ (B, 196, 768)   │   │  │(CSPDark)│            │  │     ↓            │   │
+│  └────────┬────────┘   │  └────┬────┘            │  │    WBF           │   │
+│           │            │       │                 │  └────────┬─────────┘   │
+│           │            │  ┌────┴────┐            │           │             │
+│           │            │  │  Neck   │            │           │             │
+│           │            │  │(PANet)  │            │           │             │
+│           │            │  └────┬────┘            │           │             │
+│           │            │       │                 │           │             │
+│           │            │  ┌────┴────┐   Features │           │             │
+│           │            │  │  Head   │ ◄──────────┼───────────┤             │
+│           │            │  │(Decouple)│           │           │             │
+│           │            │  └────┬────┘            │           │             │
+│           │            │       │                 │           │             │
+│           │            │  ┌────┴────┐            │           │             │
+│           │            │  │   NMS   │            │           │             │
+│           │            │  └────┬────┘            │           │             │
+│           │            │       │                 │           │             │
+│           │            │  ┌────┴────────────┐    │           │             │
+│           │            │  │YOLOOutputWrapper│    │           │             │
+│           │            │  │ (Padding + Mask)│    │           │             │
+│           │            │  └────┬────────────┘    │           │             │
+│           │            └───────┼─────────────────┘           │             │
+│           │                    │                             │             │
+│           │     ┌──────────────┼──────────────┐              │             │
+│           │     │              │              │              │             │
+│           │     ▼              ▼              ▼              │             │
+│           │  Features      Boxes          Logits            │             │
+│           │  (adapted)   [B,100,4]     [B,100,C]            │             │
+│           │     │              │              │              │             │
+│           │     │              └──────┬───────┘              │             │
+│           │     │                     │                      │             │
+│           ▼     ▼                     ▼                      ▼             │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │                          MTKD Loss                                  │   │
+│  │  ┌─────────────────────┐       ┌─────────────────────────────┐     │   │
+│  │  │  Feature Alignment  │       │   Prediction Alignment      │     │   │
+│  │  │  (DINO ↔ YOLO feat) │       │   (Ensemble ↔ YOLO pred)    │     │   │
+│  │  │                     │       │                             │     │   │
+│  │  │  - L2/Cosine Loss   │       │  - HungarianMatchingLoss    │     │   │
+│  │  │  - Token Matching   │       │  - BoxAlignmentLoss (GIoU)  │     │   │
+│  │  └─────────────────────┘       │  - ClassAlignmentLoss (KL)  │     │   │
+│  │                                └─────────────────────────────┘     │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### YOLO vs DETR 格式對比
+
+| 特性 | DETR (當前實作) | YOLO | 解決方案 |
+|-----|----------------|------|---------|
+| 預測數量 | 固定 (num_queries=100) | 不固定 (NMS 後) | Padding + Valid Mask |
+| Box 格式 | cxcywh normalized | xyxy 或 cxcywh | 格式轉換層 |
+| Logits | [N, C+1] 含背景類 | [N, C] 或 objectness 分開 | 格式統一 |
+| 特徵尺度 | 單尺度 (來自 Decoder) | 多尺度 P3/P4/P5 | 選擇性對齊 |
+
+### YOLOOutputWrapper
+
+將 YOLO 的 NMS 後輸出轉換為 MTKD 統一格式：
+
+```python
+class YOLOOutputWrapper(nn.Module):
+    """
+    包裝 YOLO 輸出為 MTKD 格式
+
+    YOLO 輸出 (NMS 後):
+        boxes: List[Tensor] - 每張圖的 [N_i, 4] (xyxy)
+        scores: List[Tensor] - 每張圖的 [N_i]
+        labels: List[Tensor] - 每張圖的 [N_i]
+
+    MTKD 格式:
+        {
+            "boxes": [B, max_det, 4] (cxcywh normalized),
+            "logits": [B, max_det, C],
+            "valid_mask": [B, max_det]
+        }
+    """
+
+    def __init__(
+        self,
+        max_detections: int = 100,
+        num_classes: int = 1,
+        box_format: str = "xyxy",  # YOLO 輸出格式
+        normalize_boxes: bool = True,
+    ):
+        super().__init__()
+        self.max_detections = max_detections
+        self.num_classes = num_classes
+        self.box_format = box_format
+        self.normalize_boxes = normalize_boxes
+
+    def forward(
+        self,
+        yolo_boxes: List[torch.Tensor],  # List of [N_i, 4]
+        yolo_scores: List[torch.Tensor],  # List of [N_i]
+        yolo_labels: List[torch.Tensor],  # List of [N_i]
+        image_sizes: torch.Tensor,        # [B, 2] (H, W)
+    ) -> Dict[str, torch.Tensor]:
+        B = len(yolo_boxes)
+        device = yolo_boxes[0].device
+
+        # 初始化輸出 tensors
+        boxes = torch.zeros(B, self.max_detections, 4, device=device)
+        logits = torch.zeros(B, self.max_detections, self.num_classes + 1, device=device)
+        logits[..., -1] = 1.0  # 背景類初始化為 1
+        valid_mask = torch.zeros(B, self.max_detections, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            n_det = min(len(yolo_boxes[b]), self.max_detections)
+            if n_det == 0:
+                continue
+
+            # 複製檢測結果
+            b_boxes = yolo_boxes[b][:n_det]
+            b_scores = yolo_scores[b][:n_det]
+            b_labels = yolo_labels[b][:n_det].long()
+
+            # Box 格式轉換: xyxy → cxcywh
+            if self.box_format == "xyxy":
+                x1, y1, x2, y2 = b_boxes.unbind(-1)
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w = x2 - x1
+                h = y2 - y1
+                b_boxes = torch.stack([cx, cy, w, h], dim=-1)
+
+            # 正規化 boxes
+            if self.normalize_boxes:
+                img_h, img_w = image_sizes[b]
+                b_boxes = b_boxes / torch.tensor([img_w, img_h, img_w, img_h], device=device)
+
+            boxes[b, :n_det] = b_boxes
+
+            # 將 scores 和 labels 轉換為 logits
+            # 使用 logit = log(p / (1-p)) 的逆運算
+            for i in range(n_det):
+                label = b_labels[i]
+                score = b_scores[i].clamp(1e-6, 1 - 1e-6)
+                logits[b, i, label] = torch.log(score / (1 - score))
+                logits[b, i, -1] = torch.log((1 - score) / score)  # 背景
+
+            valid_mask[b, :n_det] = True
+
+        return {
+            "boxes": boxes,
+            "logits": logits,
+            "valid_mask": valid_mask,
+        }
+```
+
+### YOLOFeatureAdapter
+
+適配 YOLO 多尺度特徵到 DINO 格式：
+
+```python
+class YOLOFeatureAdapter(nn.Module):
+    """
+    將 YOLO 多尺度特徵適配到 DINO 格式
+
+    策略選項:
+    1. "global": 全局平均池化後對齊
+    2. "p4": 只使用 P4 (stride=16) 與 DINO patch 對齊
+    3. "multi_scale": 多尺度聚合後對齊
+    """
+
+    def __init__(
+        self,
+        yolo_channels: List[int] = [256, 512, 1024],  # P3, P4, P5
+        dino_dim: int = 768,
+        strategy: str = "p4",
+        adapter_type: str = "mlp",
+    ):
+        super().__init__()
+        self.strategy = strategy
+        self.dino_dim = dino_dim
+
+        if strategy == "global":
+            # 使用 P5 的通道數
+            self.adapter = FeatureAdapter(
+                student_dim=yolo_channels[-1],
+                teacher_dim=dino_dim,
+                adapter_type=adapter_type,
+            )
+        elif strategy == "p4":
+            # P4 stride=16，與 DINO patch_size=16 對應
+            self.adapter = FeatureAdapter(
+                student_dim=yolo_channels[1],  # P4 channels
+                teacher_dim=dino_dim,
+                adapter_type=adapter_type,
+            )
+        elif strategy == "multi_scale":
+            # 先聚合再適配
+            total_channels = sum(yolo_channels)
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.adapter = FeatureAdapter(
+                student_dim=total_channels,
+                teacher_dim=dino_dim,
+                adapter_type=adapter_type,
+            )
+
+    def forward(
+        self,
+        yolo_features: Dict[str, torch.Tensor],  # {"P3": ..., "P4": ..., "P5": ...}
+        dino_patch_size: Tuple[int, int] = (14, 14),
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Returns:
+            {
+                "global_features": [B, dino_dim],  # 與 DINO CLS token 對齊
+                "spatial_features": [B, H*W, dino_dim],  # 與 DINO patch tokens 對齊 (可選)
+            }
+        """
+        if self.strategy == "global":
+            # 全局特徵
+            p5 = yolo_features.get("P5", list(yolo_features.values())[-1])
+            global_feat = F.adaptive_avg_pool2d(p5, 1).flatten(1)  # [B, C]
+            adapted_global = self.adapter(global_feat)  # [B, dino_dim]
+
+            return {"global_features": adapted_global}
+
+        elif self.strategy == "p4":
+            # P4 特徵（stride=16，與 DINO patch 對齊）
+            p4 = yolo_features.get("P4", list(yolo_features.values())[1])
+
+            # 全局特徵
+            global_feat = F.adaptive_avg_pool2d(p4, 1).flatten(1)
+            adapted_global = self.adapter(global_feat)
+
+            # 空間特徵（與 DINO patch tokens 對齊）
+            p4_resized = F.interpolate(p4, size=dino_patch_size, mode="bilinear", align_corners=False)
+            B, C, H, W = p4_resized.shape
+            spatial_feat = p4_resized.flatten(2).transpose(1, 2)  # [B, H*W, C]
+            adapted_spatial = self.adapter(spatial_feat)  # [B, H*W, dino_dim]
+
+            return {
+                "global_features": adapted_global,
+                "spatial_features": adapted_spatial,
+            }
+
+        elif self.strategy == "multi_scale":
+            # 多尺度聚合
+            pooled = []
+            for feat in yolo_features.values():
+                pooled.append(self.pool(feat).flatten(1))
+            concat_feat = torch.cat(pooled, dim=-1)  # [B, sum(channels)]
+            adapted_global = self.adapter(concat_feat)
+
+            return {"global_features": adapted_global}
+```
+
+### YOLOStudentDetector
+
+封裝 YOLO 模型的完整 Student 實現：
+
+```python
+class YOLOStudentDetector(nn.Module):
+    """
+    YOLO Student Detector for MTKD
+
+    支持的 YOLO 變體:
+    - ultralytics/yolov5
+    - ultralytics/yolov8
+    - 自定義 YOLO 模型
+    """
+
+    def __init__(
+        self,
+        yolo_model: nn.Module,
+        num_classes: int = 1,
+        max_detections: int = 100,
+        dino_teacher_dim: int = 768,
+        feature_adapter_strategy: str = "p4",
+        conf_threshold: float = 0.001,  # 訓練時用低閾值
+        iou_threshold: float = 0.65,
+    ):
+        super().__init__()
+        self.yolo = yolo_model
+        self.num_classes = num_classes
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+
+        # 輸出包裝器
+        self.output_wrapper = YOLOOutputWrapper(
+            max_detections=max_detections,
+            num_classes=num_classes,
+        )
+
+        # 特徵適配器
+        # 需要根據具體 YOLO 模型調整通道數
+        yolo_channels = self._get_yolo_channels()
+        self.feature_adapter = YOLOFeatureAdapter(
+            yolo_channels=yolo_channels,
+            dino_dim=dino_teacher_dim,
+            strategy=feature_adapter_strategy,
+        )
+
+    def _get_yolo_channels(self) -> List[int]:
+        """獲取 YOLO 各尺度的通道數（需要根據具體模型調整）"""
+        # YOLOv8 默認通道數
+        return [256, 512, 1024]
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        return_features: bool = True,
+        return_adapted_features: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass
+
+        Args:
+            images: [B, 3, H, W]
+
+        Returns:
+            {
+                "boxes": [B, max_det, 4],
+                "logits": [B, max_det, C+1],
+                "valid_mask": [B, max_det],
+                "adapted_features": [B, dino_dim],  # 用於 Feature Alignment
+                "adapted_spatial_features": [B, N, dino_dim],  # 可選
+            }
+        """
+        B, _, H, W = images.shape
+        image_sizes = torch.tensor([[H, W]] * B, device=images.device)
+
+        # YOLO forward（獲取特徵和預測）
+        # 這裡需要根據具體 YOLO 實現調整
+        yolo_output = self.yolo(images)
+
+        # 提取多尺度特徵
+        if hasattr(self.yolo, 'model'):
+            # Ultralytics YOLO
+            features = self._extract_ultralytics_features(images)
+        else:
+            # 自定義 YOLO
+            features = yolo_output.get("features", {})
+
+        # 執行 NMS 獲取檢測結果
+        detections = self._post_process(yolo_output, image_sizes)
+
+        # 包裝輸出
+        wrapped = self.output_wrapper(
+            yolo_boxes=detections["boxes"],
+            yolo_scores=detections["scores"],
+            yolo_labels=detections["labels"],
+            image_sizes=image_sizes,
+        )
+
+        outputs = {
+            "boxes": wrapped["boxes"],
+            "logits": wrapped["logits"],
+            "valid_mask": wrapped["valid_mask"],
+        }
+
+        # 特徵適配
+        if return_adapted_features and features:
+            adapted = self.feature_adapter(features)
+            outputs["adapted_features"] = adapted["global_features"]
+            if "spatial_features" in adapted:
+                outputs["adapted_spatial_features"] = adapted["spatial_features"]
+
+        return outputs
+
+    def _extract_ultralytics_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """從 Ultralytics YOLO 提取特徵"""
+        features = {}
+        # 這需要 hook 或修改 YOLO forward
+        # 示例實現略
+        return features
+
+    def _post_process(
+        self,
+        yolo_output,
+        image_sizes: torch.Tensor,
+    ) -> Dict[str, List[torch.Tensor]]:
+        """YOLO 後處理（NMS）"""
+        # 這需要根據具體 YOLO 實現調整
+        # 示例返回格式
+        return {
+            "boxes": [],  # List[Tensor]
+            "scores": [],
+            "labels": [],
+        }
+```
+
+### Prediction Alignment 策略
+
+#### 方案 A：Hungarian Matching（推薦）
+
+當 YOLO 和 Teacher 預測數量不同時：
+
+```python
+from mtkd_framework.losses import HungarianMatchingLoss
+
+# 建立損失函數
+hungarian_loss = HungarianMatchingLoss(
+    box_cost_weight=5.0,
+    class_cost_weight=2.0,
+    box_loss_type="giou",
+    class_loss_type="kl",
+)
+
+# YOLO predictions (NMS 後，數量可變)
+yolo_pred = {
+    "boxes": yolo_outputs["boxes"],      # [B, N_yolo, 4]
+    "logits": yolo_outputs["logits"],    # [B, N_yolo, C]
+}
+
+# Teacher predictions (WBF 後)
+teacher_pred = ensemble_teachers(images)  # [B, N_teacher, ...]
+
+# 計算損失（自動處理不同數量的配對）
+loss, loss_dict = hungarian_loss(yolo_pred, teacher_pred)
+```
+
+#### 方案 B：Padded Matching with Mask
+
+使用 `valid_mask` 標記有效預測：
+
+```python
+from mtkd_framework.losses import PredictionAlignmentLoss
+
+loss_fn = PredictionAlignmentLoss(
+    box_loss_type="giou",
+    class_loss_type="kl",
+)
+
+# 兩邊都已 pad 到 max_detections
+loss, loss_dict = loss_fn(
+    student_predictions=yolo_pred,
+    teacher_predictions=teacher_pred,
+    valid_mask=yolo_outputs["valid_mask"] & teacher_pred["valid_mask"],
+)
+```
+
+### Feature Alignment 策略
+
+#### 全局特徵對齊
+
+```python
+# YOLO 全局特徵（已適配到 DINO 維度）
+yolo_global = yolo_outputs["adapted_features"]  # [B, 768]
+
+# DINO CLS token
+dino_cls = dino_teacher(images)["cls_token"]  # [B, 768]
+
+# Cosine Loss
+feature_loss = 1 - F.cosine_similarity(yolo_global, dino_cls, dim=-1).mean()
+```
+
+#### 空間特徵對齊（進階）
+
+```python
+# YOLO P4 特徵（已適配）
+yolo_patches = yolo_outputs["adapted_spatial_features"]  # [B, 196, 768]
+
+# DINO patch tokens
+dino_patches = dino_teacher(images)["patch_tokens"]  # [B, 196, 768]
+
+# Token Matching Loss
+from mtkd_framework.losses import TokenMatchingLoss
+
+token_loss = TokenMatchingLoss(token_type="patch", loss_type="cosine")
+spatial_loss = token_loss(yolo_patches, dino_patches)
+```
+
+### 完整使用範例
+
+```python
+from mtkd_framework import MTKDModel
+from mtkd_framework.models.student_model import YOLOStudentDetector
+from ultralytics import YOLO
+
+# 1. 載入 YOLO 模型
+yolo_base = YOLO("yolov8n.pt").model
+
+# 2. 包裝為 YOLO Student
+yolo_student = YOLOStudentDetector(
+    yolo_model=yolo_base,
+    num_classes=1,
+    max_detections=100,
+    dino_teacher_dim=768,
+    feature_adapter_strategy="p4",
+)
+
+# 3. 建立 MTKD 模型（使用自定義 student）
+mtkd_model = MTKDModel(
+    custom_student=yolo_student,
+    dino_teacher_config={"model_name": "vit_base"},
+    ensemble_config={"teacher_weights": [0.6, 0.4]},
+    loss_config={
+        "feature_weight": 1.0,
+        "prediction_weight": 2.0,
+        "use_hungarian_matching": True,  # 啟用 Hungarian Matching
+    },
+    num_classes=1,
+)
+
+# 4. 載入預訓練權重
+mtkd_model.dino_teacher.load_pretrained("dino_vitb16.pth")
+mtkd_model.ensemble_teachers.add_teacher(teacher1, weight=0.6)
+mtkd_model.ensemble_teachers.add_teacher(teacher2, weight=0.4)
+
+# 5. 訓練
+optimizer = torch.optim.AdamW(
+    mtkd_model.get_trainable_parameters(),  # 只有 YOLO student 可訓練
+    lr=1e-4,
+)
+
+for epoch in range(100):
+    for images, targets in train_loader:
+        loss, loss_dict = mtkd_model.training_step(images, targets, epoch=epoch)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        print(f"Loss: {loss.item():.4f}")
+        print(f"  Feature Align: {loss_dict.get('feature_align_loss', 0):.4f}")
+        print(f"  Prediction Align: {loss_dict.get('pred_align_total_loss', 0):.4f}")
+```
+
+### 配置範例
+
+```python
+yolo_mtkd_config = {
+    "model": {
+        "num_classes": 1,
+        "student_type": "yolo",  # 指定使用 YOLO
+        "student_config": {
+            "yolo_variant": "yolov8n",
+            "max_detections": 100,
+            "feature_adapter_strategy": "p4",
+            "conf_threshold": 0.001,
+            "iou_threshold": 0.65,
+        },
+        "dino_teacher_config": {
+            "model_name": "vit_base",
+            "patch_size": 16,
+            "embed_dim": 768,
+        },
+        "ensemble_config": {
+            "fusion_method": "wbf",
+            "fusion_config": {"iou_threshold": 0.55},
+            "teacher_weights": [0.6, 0.4],
+        },
+        "loss_config": {
+            "feature_weight": 1.0,
+            "prediction_weight": 2.0,
+            "feature_loss_type": "cosine",
+            "prediction_loss_type": "hungarian",  # 使用 Hungarian Matching
+            "box_loss_type": "giou",
+            "class_loss_type": "kl",
+            "temperature": 4.0,
+        },
+    },
+    "training": {
+        "epochs": 100,
+        "batch_size": 16,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 5,
+    },
+}
+```
+
+### 注意事項
+
+1. **NMS 閾值**：訓練時使用較低的 `conf_threshold` (如 0.001) 以保留更多預測供對齊
+2. **特徵提取**：需要修改 YOLO 模型以輸出中間特徵，或使用 forward hooks
+3. **Box 格式**：確保 YOLO 和 Teacher 的 box 格式一致（都轉為 cxcywh normalized）
+4. **梯度流**：確保 DINO 和 Ensemble Teachers 完全凍結
+
+---
+
+## 實作細節與狀態
+
+本章節詳細記錄 MTKD 框架各模組的完整實作細節，包括已實作的功能、API 細節和內部運作機制。
+
+### 實作狀態總覽
+
+| 模組 | 檔案 | 實作狀態 | 說明 |
+|------|------|---------|------|
+| **Feature Alignment Loss** | `losses/feature_alignment.py` | ✅ 完整 | L2, Cosine, KL, Smooth L1 |
+| **Prediction Alignment Loss** | `losses/prediction_alignment.py` | ✅ 完整 | GIoU, CIoU, Hungarian Matching |
+| **Combined Loss** | `losses/combined_loss.py` | ✅ 完整 | 標準版 + Adaptive + Uncertainty |
+| **Student Model** | `models/student_model.py` | ✅ 完整 | DETR-like 架構 |
+| **Teacher Ensemble** | `models/teacher_ensemble.py` | ✅ 完整 | WBF + Soft-NMS |
+| **MTKD Model** | `models/mtkd_model.py` | ✅ 完整 | 整合所有組件 |
+| **Training Pipeline** | `train.py` | ✅ 完整 | MTKDTrainer 類別 |
+| **YOLO Student** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
+
+---
+
+### MTKDLoss 變體詳解
+
+#### 1. 標準 MTKDLoss
+
+**檔案**: `losses/combined_loss.py:18-191`
+
+```python
+class MTKDLoss(nn.Module):
+    """
+    標準 MTKD 組合損失
+
+    特性:
+    - 動態權重調整（Warmup + Schedule）
+    - 支援檢測損失（與 Ground Truth）
+    - 損失項詳細追蹤
+    """
+```
+
+**初始化參數詳解**:
+
+| 參數 | 類型 | 默認值 | 說明 |
+|------|------|--------|------|
+| `feature_loss_config` | dict | `{}` | FeatureAlignmentLoss 配置 |
+| `prediction_loss_config` | dict | `{}` | PredictionAlignmentLoss 配置 |
+| `feature_weight` | float | 1.0 | 特徵對齊損失權重 |
+| `prediction_weight` | float | 1.0 | 預測對齊損失權重 |
+| `detection_weight` | float | 0.0 | 檢測損失權重（0 表示禁用）|
+| `warmup_epochs` | int | 0 | 權重 warmup 輪數 |
+| `weight_schedule` | str | "constant" | 權重調度策略 |
+| `min_weight_ratio` | float | 0.1 | 最小權重比例 |
+
+**權重調度策略**:
+
+```python
+# 支援的調度類型
+weight_schedule: Literal["constant", "linear", "cosine"] = "constant"
+
+# Warmup 期間的權重計算
+if epoch < warmup_epochs:
+    warmup_factor = epoch / warmup_epochs
+else:
+    warmup_factor = 1.0
+
+# 調度計算
+if weight_schedule == "linear":
+    schedule_factor = 1 - (1 - min_weight_ratio) * (epoch / total_epochs)
+elif weight_schedule == "cosine":
+    schedule_factor = min_weight_ratio + (1 - min_weight_ratio) * (1 + cos(π * epoch / total_epochs)) / 2
+else:
+    schedule_factor = 1.0
+
+final_weight = base_weight * warmup_factor * schedule_factor
+```
+
+**Forward 簽名**:
+
+```python
+def forward(
+    self,
+    student_features: torch.Tensor,          # [B, D] 或 [B, N, D]
+    dino_teacher_features: torch.Tensor,      # [B, D] 或 [B, N, D]
+    student_predictions: Dict[str, Tensor],   # {"boxes": [B, N, 4], "logits": [B, N, C]}
+    ensemble_teacher_predictions: Dict,       # 同上
+    targets: Optional[List[Dict]] = None,     # Ground truth（用於檢測損失）
+    epoch: int = 0,
+    total_epochs: int = 100,
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Returns:
+        total_loss: 加權總損失
+        loss_dict: {
+            "feature_align_loss": ...,
+            "pred_align_total_loss": ...,
+            "pred_align_box_loss": ...,
+            "pred_align_class_loss": ...,
+            "detection_loss": ...,  # 如果啟用
+            "total_loss": ...,
+            "feature_weight": ...,
+            "prediction_weight": ...,
+        }
+    """
+```
+
+#### 2. AdaptiveMTKDLoss
+
+**檔案**: `losses/combined_loss.py:194-293`
+
+自動調整損失權重，根據各損失項的相對大小動態平衡。
+
+```python
+class AdaptiveMTKDLoss(MTKDLoss):
+    """
+    自適應 MTKD 損失
+
+    特性:
+    - 使用 EMA 追蹤各損失項的統計資訊
+    - 根據損失的標準差自動調整權重
+    - 防止單一損失項主導訓練
+    """
+```
+
+**額外初始化參數**:
+
+| 參數 | 類型 | 默認值 | 說明 |
+|------|------|--------|------|
+| `ema_decay` | float | 0.999 | EMA 衰減係數 |
+| `loss_scale_method` | str | "std" | 縮放方法 ("std", "mean", "max") |
+
+**自適應權重計算**:
+
+```python
+# EMA 更新
+self.loss_mean = ema_decay * self.loss_mean + (1 - ema_decay) * current_loss
+self.loss_sq_mean = ema_decay * self.loss_sq_mean + (1 - ema_decay) * current_loss ** 2
+
+# 計算標準差
+std = sqrt(self.loss_sq_mean - self.loss_mean ** 2)
+
+# 權重縮放（反比於標準差）
+adaptive_weight = base_weight / (std + epsilon)
+```
+
+#### 3. UncertaintyWeightedMTKDLoss
+
+**檔案**: `losses/combined_loss.py:296-413`
+
+基於同方差不確定性的可學習損失權重。
+
+```python
+class UncertaintyWeightedMTKDLoss(MTKDLoss):
+    """
+    基於不確定性的 MTKD 損失
+
+    理論基礎:
+    - 論文: "Multi-Task Learning Using Uncertainty to Weigh Losses"
+    - 使用可學習的 log_variance 參數
+    - 損失項的權重與其不確定性成反比
+
+    公式:
+    L_total = Σ (1 / (2 * exp(log_var_i))) * L_i + log_var_i / 2
+    """
+```
+
+**可學習參數**:
+
+```python
+# 在 __init__ 中初始化
+self.log_var_feature = nn.Parameter(torch.zeros(1))   # log(σ²) for feature loss
+self.log_var_prediction = nn.Parameter(torch.zeros(1))  # log(σ²) for prediction loss
+self.log_var_detection = nn.Parameter(torch.zeros(1))   # log(σ²) for detection loss
+```
+
+**損失計算**:
+
+```python
+# 不確定性加權
+precision_feature = torch.exp(-self.log_var_feature)
+weighted_feature_loss = precision_feature * feature_loss + self.log_var_feature / 2
+
+precision_prediction = torch.exp(-self.log_var_prediction)
+weighted_pred_loss = precision_prediction * pred_loss + self.log_var_prediction / 2
+
+total_loss = weighted_feature_loss + weighted_pred_loss + ...
+```
+
+**訓練建議**:
+
+```python
+# 需要將 log_var 參數加入 optimizer
+optimizer = torch.optim.AdamW([
+    {"params": model.student.parameters(), "lr": 1e-4},
+    {"params": loss_fn.parameters(), "lr": 1e-3},  # 較高學習率
+])
+```
+
+---
+
+### WeightedBoxFusion (WBF) 詳解
+
+**檔案**: `models/teacher_ensemble.py:21-178`
+
+完整的 WBF 實作，用於融合多個檢測模型的預測。
+
+```python
+class WeightedBoxFusion(nn.Module):
+    """
+    Weighted Box Fusion
+
+    與 NMS 的區別:
+    - NMS: 刪除重疊的 boxes，只保留最高分
+    - WBF: 融合重疊的 boxes，取加權平均
+
+    優點:
+    - 利用多模型的互補資訊
+    - 產生更穩定、準確的 boxes
+    - 融合後的置信度更可靠
+    """
+```
+
+**初始化參數**:
+
+| 參數 | 類型 | 默認值 | 說明 |
+|------|------|--------|------|
+| `iou_threshold` | float | 0.55 | 融合 IoU 閾值 |
+| `skip_box_thr` | float | 0.0 | 忽略低於此分數的 boxes |
+| `weights` | List[float] | None | 各模型權重 |
+| `conf_type` | str | "avg" | 置信度計算方式 |
+
+**置信度計算方式**:
+
+```python
+# conf_type 選項
+"avg"       # 加權平均
+"max"       # 取最大值
+"box_and_model_avg"  # Box 數量 + 模型權重加權
+"absent_model_aware_avg"  # 考慮缺失模型的平均
+```
+
+**WBF 算法流程（實際程式碼邏輯）**:
+
+```python
+def forward(self, boxes_list, scores_list, labels_list):
+    """
+    Args:
+        boxes_list: List[Tensor] - 每個模型的 boxes [N_i, 4]
+        scores_list: List[Tensor] - 每個模型的 scores [N_i]
+        labels_list: List[Tensor] - 每個模型的 labels [N_i]
+
+    Returns:
+        fused_boxes: Tensor [M, 4]
+        fused_scores: Tensor [M]
+        fused_labels: Tensor [M]
+    """
+    # 1. 按類別分組
+    for label in unique_labels:
+        class_boxes = filter_by_label(all_boxes, label)
+
+        # 2. 按分數排序
+        sorted_boxes = sort_by_score(class_boxes)
+
+        # 3. 聚類重疊 boxes
+        clusters = []
+        for box in sorted_boxes:
+            matched = False
+            for cluster in clusters:
+                if iou(box, cluster.representative) > iou_threshold:
+                    cluster.add(box)
+                    matched = True
+                    break
+            if not matched:
+                clusters.append(new_cluster(box))
+
+        # 4. 對每個 cluster 計算加權平均
+        for cluster in clusters:
+            weights = [model_weights[box.model_id] * box.score for box in cluster]
+            fused_box = weighted_average(cluster.boxes, weights)
+            fused_score = calculate_confidence(cluster, conf_type)
+            results.append((fused_box, fused_score, label))
+
+    return fused_boxes, fused_scores, fused_labels
+```
+
+---
+
+### Soft-NMS 詳解
+
+**檔案**: `models/teacher_ensemble.py:181-276`
+
+Soft-NMS 作為 WBF 的替代方案，通過降低重疊 box 分數而非刪除。
+
+```python
+class SoftNMS(nn.Module):
+    """
+    Soft Non-Maximum Suppression
+
+    與傳統 NMS 的區別:
+    - 傳統 NMS: 直接刪除重疊的低分 boxes
+    - Soft-NMS: 根據 IoU 降低重疊 boxes 的分數
+
+    優點:
+    - 保留密集物體的檢測
+    - 減少漏檢
+    """
+```
+
+**初始化參數**:
+
+| 參數 | 類型 | 默認值 | 說明 |
+|------|------|--------|------|
+| `iou_threshold` | float | 0.3 | 開始降分的 IoU 閾值 |
+| `score_threshold` | float | 0.001 | 最終保留的分數閾值 |
+| `sigma` | float | 0.5 | Gaussian 衰減參數 |
+| `method` | str | "gaussian" | 衰減方法 |
+
+**衰減方法**:
+
+```python
+# method = "linear"
+if iou > iou_threshold:
+    score = score * (1 - iou)
+
+# method = "gaussian" (更平滑)
+score = score * exp(-iou^2 / sigma)
+```
+
+---
+
+### TeacherEnsemble 詳解
+
+**檔案**: `models/teacher_ensemble.py:279-655`
+
+管理多個 Teacher 模型並融合預測的完整實作。
+
+```python
+class TeacherEnsemble(nn.Module):
+    """
+    Teacher Ensemble 模組
+
+    特性:
+    - 動態添加/移除 Teacher
+    - 支援從 checkpoints 批量載入
+    - 自動管理模型權重
+    - 可選 WBF 或 Soft-NMS 融合
+    """
+```
+
+**主要方法**:
+
+```python
+def add_teacher(
+    self,
+    model: nn.Module,
+    weight: float = 1.0,
+    name: Optional[str] = None,
+):
+    """
+    添加 Teacher 模型
+
+    Args:
+        model: 檢測模型（必須輸出 boxes, scores, labels）
+        weight: 模型權重
+        name: 模型名稱（用於識別）
+    """
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    self.teachers.append(model)
+    self.weights.append(weight)
+
+def load_teachers_from_checkpoints(
+    self,
+    checkpoint_paths: List[str],
+    model_class: Type[nn.Module],
+    weights: Optional[List[float]] = None,
+    **model_kwargs,
+):
+    """
+    從多個 checkpoint 載入 Teachers
+
+    Args:
+        checkpoint_paths: checkpoint 路徑列表
+        model_class: 模型類別
+        weights: 各模型權重
+        **model_kwargs: 模型初始化參數
+    """
+
+def forward(
+    self,
+    images: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """
+    獲取融合預測
+
+    Returns:
+        {
+            "boxes": [B, max_det, 4],
+            "scores": [B, max_det],
+            "labels": [B, max_det],
+            "valid_mask": [B, max_det],
+        }
+    """
+```
+
+---
+
+### MTKDTrainer 訓練器詳解
+
+**檔案**: `train.py:139-437`
+
+完整的訓練管線實作。
+
+```python
+class MTKDTrainer:
+    """
+    MTKD 訓練器
+
+    特性:
+    - 混合精度訓練 (AMP)
+    - 梯度裁剪
+    - 學習率調度（Warmup + Cosine Annealing）
+    - Early Stopping
+    - Checkpoint 保存/載入
+    - 訓練指標追蹤
+    """
+```
+
+**初始化參數**:
+
+| 參數 | 類型 | 默認值 | 說明 |
+|------|------|--------|------|
+| `config` | dict | 必填 | 訓練配置 |
+| `model` | MTKDModel | 必填 | MTKD 模型 |
+| `train_loader` | DataLoader | 必填 | 訓練數據 |
+| `val_loader` | DataLoader | None | 驗證數據 |
+| `device` | str | "cuda" | 運算設備 |
+
+**配置結構（get_default_config）**:
+
+```python
+def get_default_config() -> Dict:
+    return {
+        "model": {
+            "num_classes": 1,
+            "student_config": {
+                "backbone_config": {
+                    "backbone_type": "resnet50",
+                    "pretrained": True,
+                    "out_channels": [256, 512, 1024, 2048],
+                },
+                "head_config": {
+                    "num_classes": 1,
+                    "num_queries": 100,
+                    "hidden_dim": 256,
+                    "num_heads": 8,
+                    "num_encoder_layers": 6,
+                    "num_decoder_layers": 6,
+                },
+            },
+            "dino_teacher_config": {
+                "model_name": "vit_base",
+                "patch_size": 16,
+                "embed_dim": 768,
+            },
+            "ensemble_config": {
+                "fusion_method": "wbf",
+                "fusion_config": {
+                    "iou_threshold": 0.55,
+                    "conf_type": "avg",
+                },
+            },
+            "loss_config": {
+                "feature_weight": 1.0,
+                "prediction_weight": 2.0,
+                "detection_weight": 0.0,
+                "warmup_epochs": 5,
+                "weight_schedule": "cosine",
+                "feature_loss_config": {
+                    "loss_type": "cosine",
+                    "normalize": True,
+                },
+                "prediction_loss_config": {
+                    "box_loss_type": "giou",
+                    "class_loss_type": "kl",
+                    "temperature": 4.0,
+                },
+            },
+        },
+        "training": {
+            "epochs": 100,
+            "batch_size": 8,
+            "learning_rate": 1e-4,
+            "weight_decay": 1e-4,
+            "gradient_clip_max_norm": 1.0,
+            "mixed_precision": True,
+            "lr_scheduler": "cosine",
+            "warmup_epochs": 5,
+            "min_lr": 1e-6,
+        },
+        "validation": {
+            "val_interval": 1,
+            "save_best": True,
+            "metric": "loss",
+        },
+        "checkpoint": {
+            "save_dir": "./checkpoints",
+            "save_interval": 10,
+            "keep_last_n": 5,
+        },
+        "early_stopping": {
+            "enabled": True,
+            "patience": 20,
+            "min_delta": 1e-4,
+        },
+    }
+```
+
+**訓練流程**:
+
+```python
+def train(self):
+    """
+    主訓練循環
+
+    流程:
+    1. 初始化 optimizer, scheduler, scaler
+    2. 每個 epoch:
+       a. 訓練一個 epoch (train_epoch)
+       b. 驗證（如果有 val_loader）
+       c. 更新 scheduler
+       d. 保存 checkpoint
+       e. 檢查 early stopping
+    """
+    for epoch in range(self.start_epoch, self.config["training"]["epochs"]):
+        # 訓練
+        train_metrics = self.train_epoch(epoch)
+
+        # 驗證
+        if self.val_loader and epoch % self.config["validation"]["val_interval"] == 0:
+            val_metrics = self.validate(epoch)
+
+        # Scheduler step
+        if self.scheduler is not None:
+            self.scheduler.step()
+
+        # Checkpoint
+        if epoch % self.config["checkpoint"]["save_interval"] == 0:
+            self.save_checkpoint(epoch)
+
+        # Early stopping
+        if self.early_stopping(val_metrics["loss"]):
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+def train_epoch(self, epoch: int) -> Dict[str, float]:
+    """
+    訓練一個 epoch
+
+    使用:
+    - Mixed precision (GradScaler)
+    - Gradient clipping
+    - Loss 追蹤
+    """
+    self.model.train()
+    meter = AverageMeterDict()
+
+    for batch_idx, (images, targets) in enumerate(self.train_loader):
+        images = images.to(self.device)
+
+        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+            loss, loss_dict = self.model.training_step(
+                images, targets, epoch=epoch,
+                total_epochs=self.config["training"]["epochs"]
+            )
+
+        # Backward
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+
+        # Gradient clipping
+        if self.gradient_clip_max_norm > 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.gradient_clip_max_norm
+            )
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        meter.update(loss_dict)
+
+    return meter.get_averages()
+```
+
+---
+
+### HungarianMatchingLoss 詳解
+
+**檔案**: `losses/prediction_alignment.py:396-657`
+
+使用 Hungarian 算法解決預測數量不一致的問題。
+
+```python
+class HungarianMatchingLoss(nn.Module):
+    """
+    Hungarian Matching Loss
+
+    用途:
+    - 當 student 和 teacher 預測數量不同時
+    - DETR 風格的一對一匹配
+    - 自動找出最優配對
+
+    算法:
+    1. 計算 cost matrix (box cost + class cost)
+    2. 使用 Hungarian 算法找最優匹配
+    3. 只對匹配的預測計算損失
+    """
+```
+
+**Cost Matrix 計算**:
+
+```python
+def _compute_cost_matrix(
+    self,
+    student_pred: Dict[str, Tensor],
+    teacher_pred: Dict[str, Tensor],
+) -> Tensor:
+    """
+    計算配對成本矩陣
+
+    Cost = box_cost_weight * box_cost + class_cost_weight * class_cost
+
+    box_cost: 1 - GIoU(student_box, teacher_box)
+    class_cost: 1 - CosineSim(student_logit, teacher_logit)
+    """
+    # Box cost
+    student_boxes = student_pred["boxes"]  # [B, N_s, 4]
+    teacher_boxes = teacher_pred["boxes"]  # [B, N_t, 4]
+
+    # 計算所有 pairs 的 GIoU
+    giou_matrix = self._compute_giou_matrix(student_boxes, teacher_boxes)
+    box_cost = 1 - giou_matrix  # [B, N_s, N_t]
+
+    # Class cost
+    student_logits = F.softmax(student_pred["logits"], dim=-1)
+    teacher_logits = F.softmax(teacher_pred["logits"], dim=-1)
+
+    # Cosine similarity
+    s_norm = F.normalize(student_logits, dim=-1)  # [B, N_s, C]
+    t_norm = F.normalize(teacher_logits, dim=-1)  # [B, N_t, C]
+    class_sim = torch.bmm(s_norm, t_norm.transpose(1, 2))  # [B, N_s, N_t]
+    class_cost = 1 - class_sim
+
+    # Total cost
+    cost_matrix = self.box_cost_weight * box_cost + self.class_cost_weight * class_cost
+
+    return cost_matrix
+```
+
+**Hungarian 求解**:
+
+```python
+def _hungarian_matching(self, cost_matrix: Tensor) -> List[Tuple[Tensor, Tensor]]:
+    """
+    使用 scipy.optimize.linear_sum_assignment 求解
+
+    Returns:
+        indices: List[(row_indices, col_indices)] for each batch
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    indices = []
+    for b in range(cost_matrix.shape[0]):
+        cost_b = cost_matrix[b].detach().cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_b)
+        indices.append((
+            torch.tensor(row_ind, device=cost_matrix.device),
+            torch.tensor(col_ind, device=cost_matrix.device)
+        ))
+    return indices
+```
+
+---
+
+### 工具類別
+
+#### AverageMeterDict
+
+**用途**: 追蹤多個訓練指標的移動平均
+
+```python
+class AverageMeterDict:
+    def __init__(self):
+        self.meters = {}
+
+    def update(self, values: Dict[str, float], n: int = 1):
+        for k, v in values.items():
+            if k not in self.meters:
+                self.meters[k] = {"sum": 0, "count": 0}
+            self.meters[k]["sum"] += v * n
+            self.meters[k]["count"] += n
+
+    def get_averages(self) -> Dict[str, float]:
+        return {
+            k: v["sum"] / v["count"]
+            for k, v in self.meters.items()
+        }
+```
+
+#### EarlyStopping
+
+**用途**: 提前停止訓練以防止過擬合
+
+```python
+class EarlyStopping:
+    def __init__(
+        self,
+        patience: int = 10,
+        min_delta: float = 0.0,
+        mode: str = "min",
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+
+    def __call__(self, score: float) -> bool:
+        if self.best_score is None:
+            self.best_score = score
+            return False
+
+        if self._is_improvement(score):
+            self.best_score = score
+            self.counter = 0
+        else:
+            self.counter += 1
+
+        return self.counter >= self.patience
+
+    def _is_improvement(self, score: float) -> bool:
+        if self.mode == "min":
+            return score < self.best_score - self.min_delta
+        else:
+            return score > self.best_score + self.min_delta
+```
+
+---
+
+### 效能考量
+
+#### 記憶體優化
+
+```python
+# 1. Teachers 完全凍結，不儲存梯度
+for teacher in ensemble_teachers:
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad = False
+
+# 2. 使用 torch.no_grad() 進行 teacher 推理
+with torch.no_grad():
+    dino_features = dino_teacher(images)
+    ensemble_predictions = ensemble_teachers(images)
+
+# 3. 混合精度訓練減少記憶體
+with torch.cuda.amp.autocast():
+    student_output = student(images)
+    loss = loss_fn(...)
+```
+
+#### 計算效率
+
+| 操作 | 成本 | 優化方式 |
+|------|------|---------|
+| DINO 推理 | 高 | 批次處理 + 凍結 |
+| WBF | 中 | 向量化操作 |
+| Hungarian Matching | O(N³) | 限制 max_detections |
+| Feature Adapter | 低 | 簡單線性層 |
+
+---
+
 ## 參考文獻
 
 1. DINO: Emerging Properties in Self-Supervised Vision Transformers
 2. Knowledge Distillation: A Survey
 3. Weighted Boxes Fusion: Ensembling boxes from different object detection models
 4. Multi-Task Learning Using Uncertainty to Weigh Losses
+5. YOLOv8: Ultralytics YOLO
+6. DETR: End-to-End Object Detection with Transformers
+7. Soft-NMS: Improving Object Detection With One Line of Code
 
 ---
 
