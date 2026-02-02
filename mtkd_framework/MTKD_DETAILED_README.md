@@ -26,15 +26,26 @@
 Multi-Teacher Knowledge Distillation (MTKD) 是一種結合多個教師模型來訓練學生模型的知識蒸餾方法。本框架專為物體檢測任務設計，結合：
 
 1. **DINO Feature Teacher**: 提供強大的視覺特徵表示，用於特徵對齊
-2. **Ensemble Detection Teachers**: 多個預訓練檢測模型的集成，用於預測對齊
-3. **Student Detector**: 要訓練的輕量級學生模型
+2. **Detection Teacher(s)**: 預訓練檢測模型（單一或集成），用於預測對齊
+3. **Student Detector**: 要訓練的學生模型
+
+### 支援的架構
+
+| 架構 | Feature Teacher | Detection Teacher | Student | 狀態 |
+|-----|-----------------|-------------------|---------|------|
+| **DETR-like** | DINO ViT | Ensemble (WBF) | DETR | ✅ 已實作 |
+| **YOLO** | DINO ViT | YOLOv8 (單一) | YOLOv11 | 🔄 規劃中 |
+
+**推薦：YOLO 架構**（見 [YOLO Student 整合指南](#yolo-student-整合指南)）
+- YOLOv8 作為 Teacher：成熟穩定，提供高品質預測
+- YOLOv11 作為 Student：C3k2 + C2PSA 架構，學習能力強，收斂快
 
 ### 核心優勢
 
 - **多源知識**: 從特徵和預測兩個維度進行知識蒸餾
-- **Ensemble 增強**: 通過 Weighted Box Fusion 融合多個教師的預測
-- **靈活架構**: 支持自定義 backbone、head 和損失函數
+- **靈活架構**: 支持 DETR-like 或 YOLO 架構
 - **易於擴展**: 模組化設計，方便添加新組件
+- **Hungarian Matching**: 自動處理不同數量的預測配對
 
 ---
 
@@ -925,83 +936,347 @@ loss_fn = HungarianMatchingLoss(
 >
 > | 項目 | 狀態 |
 > |------|------|
+> | YOLOv8Teacher | ❌ 待實作 |
+> | YOLOv11StudentDetector | ❌ 待實作 |
 > | YOLOOutputWrapper | ❌ 待實作 |
 > | YOLOFeatureAdapter | ❌ 待實作 |
-> | YOLOStudentDetector | ❌ 待實作 |
 >
 > 目前 MTKD 框架已實作的 Student 為 DETR-like 架構（`StudentDetector`）。
 
-本章節說明如何將 YOLO 模型作為 Student 整合到 MTKD 框架中，實現 Feature Alignment 和 Prediction Alignment 的雙重知識蒸餾。
+本章節說明如何將 **YOLOv11** 作為 Student 整合到 MTKD 框架中，從 **DINO Teacher**（特徵）和 **YOLOv8 Teacher**（預測）學習。
+
+### 架構設計理念
+
+MTKD 框架採用雙 Teacher 設計，各司其職：
+
+| 角色 | 模型 | 輸出 | 用途 |
+|------|------|------|------|
+| **Feature Teacher** | DINO ViT-B (Frozen .pth) | CLS token + Patch tokens | Feature Alignment |
+| **Detection Teacher** | YOLOv8 (Frozen .pt) | Boxes + Scores + Labels | Prediction Alignment |
+| **Student** | YOLOv11 (Trainable) | Features + Predictions | 學習兩者 |
+
+**為什麼選擇 YOLOv11 作為 Student？**
+
+| 比較項目 | YOLOv8 | YOLOv11 |
+|---------|--------|---------|
+| 核心模組 | C2f | C3k2 (更高效的梯度流) |
+| 注意力機制 | 無 | C2PSA (Position-Sensitive Attention) |
+| 訓練收斂速度 | 較慢 (約 178 epochs 達到 0.01 loss) | 較快 (約 36 epochs 達到相同 loss) |
+| 輸出格式 | boxes, scores, labels | 與 YOLOv8 相容 |
+| 推薦用途 | **作為成熟的 Teacher** | **作為學習能力強的 Student** |
 
 ### 整體架構
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Input Image                                     │
-│                                   │                                          │
-│         ┌─────────────────────────┼─────────────────────────┐               │
-│         │                         │                         │               │
-│         ▼                         ▼                         ▼               │
-│  ┌─────────────────┐   ┌─────────────────────────┐  ┌──────────────────┐   │
-│  │  DINO Teacher   │   │    YOLO Student         │  │ Ensemble Teachers│   │
-│  │    (Frozen)     │   │    (Trainable)          │  │    (Frozen)      │   │
-│  │                 │   │                         │  │                  │   │
-│  │ cls_token       │   │  ┌─────────┐            │  │  Teacher1        │   │
-│  │ patch_tokens    │   │  │Backbone │            │  │  Teacher2        │   │
-│  │ (B, 196, 768)   │   │  │(CSPDark)│            │  │     ↓            │   │
-│  └────────┬────────┘   │  └────┬────┘            │  │    WBF           │   │
-│           │            │       │                 │  └────────┬─────────┘   │
-│           │            │  ┌────┴────┐            │           │             │
-│           │            │  │  Neck   │            │           │             │
-│           │            │  │(PANet)  │            │           │             │
-│           │            │  └────┬────┘            │           │             │
-│           │            │       │                 │           │             │
-│           │            │  ┌────┴────┐   Features │           │             │
-│           │            │  │  Head   │ ◄──────────┼───────────┤             │
-│           │            │  │(Decouple)│           │           │             │
-│           │            │  └────┬────┘            │           │             │
-│           │            │       │                 │           │             │
-│           │            │  ┌────┴────┐            │           │             │
-│           │            │  │   NMS   │            │           │             │
-│           │            │  └────┬────┘            │           │             │
-│           │            │       │                 │           │             │
-│           │            │  ┌────┴────────────┐    │           │             │
-│           │            │  │YOLOOutputWrapper│    │           │             │
-│           │            │  │ (Padding + Mask)│    │           │             │
-│           │            │  └────┬────────────┘    │           │             │
-│           │            └───────┼─────────────────┘           │             │
-│           │                    │                             │             │
-│           │     ┌──────────────┼──────────────┐              │             │
-│           │     │              │              │              │             │
-│           │     ▼              ▼              ▼              │             │
-│           │  Features      Boxes          Logits            │             │
-│           │  (adapted)   [B,100,4]     [B,100,C]            │             │
-│           │     │              │              │              │             │
-│           │     │              └──────┬───────┘              │             │
-│           │     │                     │                      │             │
-│           ▼     ▼                     ▼                      ▼             │
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │                          MTKD Loss                                  │   │
-│  │  ┌─────────────────────┐       ┌─────────────────────────────┐     │   │
-│  │  │  Feature Alignment  │       │   Prediction Alignment      │     │   │
-│  │  │  (DINO ↔ YOLO feat) │       │   (Ensemble ↔ YOLO pred)    │     │   │
-│  │  │                     │       │                             │     │   │
-│  │  │  - L2/Cosine Loss   │       │  - HungarianMatchingLoss    │     │   │
-│  │  │  - Token Matching   │       │  - BoxAlignmentLoss (GIoU)  │     │   │
-│  │  └─────────────────────┘       │  - ClassAlignmentLoss (KL)  │     │   │
-│  │                                └─────────────────────────────┘     │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
+│                              Input Image (B, 3, H, W)                        │
+│                                       │                                      │
+│         ┌─────────────────────────────┼─────────────────────────┐           │
+│         │                             │                         │           │
+│         ▼                             ▼                         ▼           │
+│  ┌──────────────────┐    ┌─────────────────────────┐   ┌──────────────────┐│
+│  │  DINO Teacher    │    │   YOLOv11 Student       │   │  YOLOv8 Teacher  ││
+│  │  (Frozen .pth)   │    │     (Trainable)         │   │  (Frozen .pt)    ││
+│  │                  │    │                         │   │                  ││
+│  │  ViT-B/16        │    │  ┌─────────────┐        │   │  Backbone        ││
+│  │  patch_size=16   │    │  │  Backbone   │        │   │  Neck            ││
+│  │                  │    │  │ (C3k2+C2PSA)│        │   │  Head            ││
+│  │  輸出:           │    │  └──────┬──────┘        │   │                  ││
+│  │  • cls_token     │    │         │               │   │  輸出:           ││
+│  │    (B, 768)      │    │  ┌──────┴──────┐        │   │  • boxes         ││
+│  │  • patch_tokens  │    │  │    Neck     │        │   │    (B, N, 4)     ││
+│  │    (B, 196, 768) │    │  │   (PANet)   │        │   │  • scores        ││
+│  │                  │    │  └──────┬──────┘        │   │    (B, N)        ││
+│  └────────┬─────────┘    │         │               │   │  • labels        ││
+│           │              │  ┌──────┴──────┐        │   │    (B, N)        ││
+│           │              │  │  P3 P4 P5   │◄───┐   │   │                  ││
+│           │              │  │  Features   │    │   │   └────────┬─────────┘│
+│           │              │  └──────┬──────┘    │   │            │          │
+│           │              │         │           │   │            │          │
+│           │              │  ┌──────┴──────┐    │   │            │          │
+│           │              │  │    Head     │    │   │            │          │
+│           │              │  │ (Decoupled) │    │   │            │          │
+│           │              │  └──────┬──────┘    │   │            │          │
+│           │              │         │           │   │            │          │
+│           │              │  ┌──────┴──────┐    │   │            │          │
+│           │              │  │    NMS      │    │   │            │          │
+│           │              │  └──────┬──────┘    │   │            │          │
+│           │              │         │           │   │            │          │
+│           │              │  輸出:  │           │   │            │          │
+│           │              │  • boxes (B, M, 4)  │   │            │          │
+│           │              │  • scores (B, M)    │   │            │          │
+│           │              │  • labels (B, M)    │   │            │          │
+│           │              └─────────┼───────────┘   │            │          │
+│           │                        │               │            │          │
+│           │              ┌─────────┴─────────┐     │            │          │
+│           │              │                   │     │            │          │
+│           ▼              ▼                   ▼     │            ▼          │
+│  ┌────────────────────────────────────────────────────────────────────────┐│
+│  │                           MTKD Loss                                     ││
+│  │                                                                         ││
+│  │   ┌────────────────────────┐      ┌────────────────────────────────┐   ││
+│  │   │   Feature Alignment    │      │    Prediction Alignment        │   ││
+│  │   │                        │      │                                │   ││
+│  │   │  DINO cls_token        │      │  YOLOv8 Teacher predictions    │   ││
+│  │   │       ↕                │      │         ↕                      │   ││
+│  │   │  YOLO11 P4 (adapted)   │      │  YOLOv11 Student predictions   │   ││
+│  │   │                        │      │                                │   ││
+│  │   │  • Cosine Similarity   │      │  • Hungarian Matching          │   ││
+│  │   │  • L2 Distance         │      │  • GIoU Loss (boxes)           │   ││
+│  │   │                        │      │  • KL Divergence (logits)      │   ││
+│  │   └────────────────────────┘      └────────────────────────────────┘   ││
+│  │                                                                         ││
+│  │   L_total = λ_feat × L_feature + λ_pred × L_prediction                  ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 資料流詳解
+
+```
+1. Input Image → 同時輸入三個模型
+
+2. DINO Teacher (Frozen):
+   Image (B, 3, 224, 224)
+     → Patch Embedding (16×16)
+     → 12 Transformer Blocks
+     → Output: cls_token (B, 768), patch_tokens (B, 196, 768)
+
+3. YOLOv8 Teacher (Frozen):
+   Image (B, 3, 640, 640)
+     → Backbone → Neck → Head → NMS
+     → Output: boxes, scores, labels (數量不固定)
+
+4. YOLOv11 Student (Trainable):
+   Image (B, 3, 640, 640)
+     → Backbone (提取 P4 特徵用於 Feature Alignment)
+     → Neck → Head → NMS
+     → Output: features (P4), boxes, scores, labels
+
+5. Loss Computation:
+   L_feature = cosine_loss(adapt(YOLO11_P4), DINO_cls)
+   L_prediction = hungarian_match(YOLO11_pred, YOLOv8_pred)
+   L_total = λ_feat × L_feature + λ_pred × L_prediction
+```
+
+### 維度對照表
+
+| 階段 | Tensor | Shape | 說明 |
+|-----|--------|-------|------|
+| **DINO Teacher 輸入** | image | (B, 3, 224, 224) | 需要 resize |
+| **DINO CLS token** | cls_token | (B, 768) | 全局語義特徵 |
+| **DINO Patch tokens** | patch_tokens | (B, 196, 768) | 14×14 空間特徵 |
+| **YOLO 輸入** | image | (B, 3, 640, 640) | 原始輸入尺寸 |
+| **YOLOv11 P4 特徵** | P4 | (B, 512, 40, 40) | stride=16 |
+| **P4 Adapted** | adapted_P4 | (B, 768) | GAP 後投影 |
+| **YOLOv8/v11 預測** | predictions | 變長 | NMS 後數量不固定 |
 
 ### YOLO vs DETR 格式對比
 
 | 特性 | DETR (當前實作) | YOLO | 解決方案 |
 |-----|----------------|------|---------|
-| 預測數量 | 固定 (num_queries=100) | 不固定 (NMS 後) | Padding + Valid Mask |
+| 預測數量 | 固定 (num_queries=100) | 不固定 (NMS 後) | Hungarian Matching |
 | Box 格式 | cxcywh normalized | xyxy 或 cxcywh | 格式轉換層 |
 | Logits | [N, C+1] 含背景類 | [N, C] 或 objectness 分開 | 格式統一 |
-| 特徵尺度 | 單尺度 (來自 Decoder) | 多尺度 P3/P4/P5 | 選擇性對齊 |
+| 特徵尺度 | 單尺度 (來自 Decoder) | 多尺度 P3/P4/P5 | 使用 P4 (stride=16) |
+
+---
+
+### YOLOv8Teacher
+
+封裝凍結的 YOLOv8 模型作為 Detection Teacher：
+
+```python
+class YOLOv8Teacher(nn.Module):
+    """
+    YOLOv8 Teacher for Prediction Alignment
+
+    載入預訓練的 YOLOv8 .pt 權重，完全凍結，
+    只輸出預測結果供 Student 學習。
+    """
+
+    def __init__(
+        self,
+        weights_path: str,  # .pt 檔案路徑
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        max_detections: int = 300,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        from ultralytics import YOLO
+
+        # 載入 YOLOv8 模型
+        self.model = YOLO(weights_path)
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        self.max_detections = max_detections
+
+        # 完全凍結
+        for param in self.model.model.parameters():
+            param.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            images: (B, 3, H, W) - 已正規化的圖像
+
+        Returns:
+            {
+                "boxes": List[Tensor],   # 每張圖的 boxes [N_i, 4] (xyxy)
+                "scores": List[Tensor],  # 每張圖的 scores [N_i]
+                "labels": List[Tensor],  # 每張圖的 labels [N_i]
+            }
+        """
+        # Ultralytics YOLO 推理
+        results = self.model.predict(
+            images,
+            conf=self.conf_threshold,
+            iou=self.iou_threshold,
+            max_det=self.max_detections,
+            verbose=False,
+        )
+
+        # 解析結果
+        boxes_list = []
+        scores_list = []
+        labels_list = []
+
+        for result in results:
+            boxes = result.boxes
+            boxes_list.append(boxes.xyxy)      # (N, 4)
+            scores_list.append(boxes.conf)     # (N,)
+            labels_list.append(boxes.cls)      # (N,)
+
+        return {
+            "boxes": boxes_list,
+            "scores": scores_list,
+            "labels": labels_list,
+        }
+```
+
+### YOLOv11StudentDetector
+
+**推薦使用 YOLOv11** 作為 Student，因為其 C3k2 和 C2PSA 模組提供更好的學習能力：
+
+```python
+class YOLOv11StudentDetector(nn.Module):
+    """
+    YOLOv11 Student Detector for MTKD
+
+    可訓練的 YOLOv11 模型，同時輸出：
+    1. P4 特徵 → 用於 Feature Alignment (對齊 DINO)
+    2. 預測結果 → 用於 Prediction Alignment (對齊 YOLOv8 Teacher)
+    """
+
+    def __init__(
+        self,
+        model_variant: str = "yolo11n",  # yolo11n/s/m/l/x
+        num_classes: int = 1,
+        dino_dim: int = 768,
+        pretrained: bool = True,
+        conf_threshold: float = 0.001,  # 訓練時用低閾值
+        iou_threshold: float = 0.65,
+    ):
+        super().__init__()
+        from ultralytics import YOLO
+
+        # 載入 YOLOv11
+        if pretrained:
+            self.model = YOLO(f"{model_variant}.pt")
+        else:
+            self.model = YOLO(f"{model_variant}.yaml")
+
+        self.num_classes = num_classes
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+
+        # P4 特徵適配器 (512 → 768)
+        # YOLOv11 P4 通道數因模型大小而異
+        p4_channels = self._get_p4_channels(model_variant)
+        self.feature_adapter = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(p4_channels, dino_dim),
+            nn.LayerNorm(dino_dim),
+        )
+
+        # 註冊 hook 提取 P4 特徵
+        self.p4_features = None
+        self._register_hooks()
+
+    def _get_p4_channels(self, variant: str) -> int:
+        """根據模型變體返回 P4 通道數"""
+        channels_map = {
+            "yolo11n": 256,
+            "yolo11s": 256,
+            "yolo11m": 512,
+            "yolo11l": 512,
+            "yolo11x": 512,
+        }
+        return channels_map.get(variant, 512)
+
+    def _register_hooks(self):
+        """註冊 forward hook 提取 P4 特徵"""
+        def hook_fn(module, input, output):
+            self.p4_features = output
+
+        # P4 位於 neck 的特定層（需要根據實際模型結構調整）
+        # 這裡假設使用 Ultralytics 的標準結構
+        # 實際使用時需要根據 model.model 結構確定正確的層
+        pass  # 實作時需要根據具體模型結構設置
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        return_features: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            images: (B, 3, H, W)
+            return_features: 是否返回適配後的特徵
+
+        Returns:
+            {
+                "boxes": List[Tensor],        # NMS 後的 boxes
+                "scores": List[Tensor],       # NMS 後的 scores
+                "labels": List[Tensor],       # NMS 後的 labels
+                "adapted_features": Tensor,   # (B, 768) - 用於 Feature Alignment
+            }
+        """
+        # YOLO forward（同時觸發 hook 提取 P4）
+        results = self.model.predict(
+            images,
+            conf=self.conf_threshold,
+            iou=self.iou_threshold,
+            verbose=False,
+        )
+
+        # 解析預測結果
+        boxes_list = []
+        scores_list = []
+        labels_list = []
+
+        for result in results:
+            boxes = result.boxes
+            boxes_list.append(boxes.xyxy)
+            scores_list.append(boxes.conf)
+            labels_list.append(boxes.cls)
+
+        outputs = {
+            "boxes": boxes_list,
+            "scores": scores_list,
+            "labels": labels_list,
+        }
+
+        # 特徵適配
+        if return_features and self.p4_features is not None:
+            adapted = self.feature_adapter(self.p4_features)  # (B, 768)
+            outputs["adapted_features"] = adapted
+
+        return outputs
+```
 
 ### YOLOOutputWrapper
 
@@ -1197,146 +1472,9 @@ class YOLOFeatureAdapter(nn.Module):
             return {"global_features": adapted_global}
 ```
 
-### YOLOStudentDetector
-
-封裝 YOLO 模型的完整 Student 實現：
-
-```python
-class YOLOStudentDetector(nn.Module):
-    """
-    YOLO Student Detector for MTKD
-
-    支持的 YOLO 變體:
-    - ultralytics/yolov5
-    - ultralytics/yolov8
-    - 自定義 YOLO 模型
-    """
-
-    def __init__(
-        self,
-        yolo_model: nn.Module,
-        num_classes: int = 1,
-        max_detections: int = 100,
-        dino_teacher_dim: int = 768,
-        feature_adapter_strategy: str = "p4",
-        conf_threshold: float = 0.001,  # 訓練時用低閾值
-        iou_threshold: float = 0.65,
-    ):
-        super().__init__()
-        self.yolo = yolo_model
-        self.num_classes = num_classes
-        self.conf_threshold = conf_threshold
-        self.iou_threshold = iou_threshold
-
-        # 輸出包裝器
-        self.output_wrapper = YOLOOutputWrapper(
-            max_detections=max_detections,
-            num_classes=num_classes,
-        )
-
-        # 特徵適配器
-        # 需要根據具體 YOLO 模型調整通道數
-        yolo_channels = self._get_yolo_channels()
-        self.feature_adapter = YOLOFeatureAdapter(
-            yolo_channels=yolo_channels,
-            dino_dim=dino_teacher_dim,
-            strategy=feature_adapter_strategy,
-        )
-
-    def _get_yolo_channels(self) -> List[int]:
-        """獲取 YOLO 各尺度的通道數（需要根據具體模型調整）"""
-        # YOLOv8 默認通道數
-        return [256, 512, 1024]
-
-    def forward(
-        self,
-        images: torch.Tensor,
-        return_features: bool = True,
-        return_adapted_features: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass
-
-        Args:
-            images: [B, 3, H, W]
-
-        Returns:
-            {
-                "boxes": [B, max_det, 4],
-                "logits": [B, max_det, C+1],
-                "valid_mask": [B, max_det],
-                "adapted_features": [B, dino_dim],  # 用於 Feature Alignment
-                "adapted_spatial_features": [B, N, dino_dim],  # 可選
-            }
-        """
-        B, _, H, W = images.shape
-        image_sizes = torch.tensor([[H, W]] * B, device=images.device)
-
-        # YOLO forward（獲取特徵和預測）
-        # 這裡需要根據具體 YOLO 實現調整
-        yolo_output = self.yolo(images)
-
-        # 提取多尺度特徵
-        if hasattr(self.yolo, 'model'):
-            # Ultralytics YOLO
-            features = self._extract_ultralytics_features(images)
-        else:
-            # 自定義 YOLO
-            features = yolo_output.get("features", {})
-
-        # 執行 NMS 獲取檢測結果
-        detections = self._post_process(yolo_output, image_sizes)
-
-        # 包裝輸出
-        wrapped = self.output_wrapper(
-            yolo_boxes=detections["boxes"],
-            yolo_scores=detections["scores"],
-            yolo_labels=detections["labels"],
-            image_sizes=image_sizes,
-        )
-
-        outputs = {
-            "boxes": wrapped["boxes"],
-            "logits": wrapped["logits"],
-            "valid_mask": wrapped["valid_mask"],
-        }
-
-        # 特徵適配
-        if return_adapted_features and features:
-            adapted = self.feature_adapter(features)
-            outputs["adapted_features"] = adapted["global_features"]
-            if "spatial_features" in adapted:
-                outputs["adapted_spatial_features"] = adapted["spatial_features"]
-
-        return outputs
-
-    def _extract_ultralytics_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """從 Ultralytics YOLO 提取特徵"""
-        features = {}
-        # 這需要 hook 或修改 YOLO forward
-        # 示例實現略
-        return features
-
-    def _post_process(
-        self,
-        yolo_output,
-        image_sizes: torch.Tensor,
-    ) -> Dict[str, List[torch.Tensor]]:
-        """YOLO 後處理（NMS）"""
-        # 這需要根據具體 YOLO 實現調整
-        # 示例返回格式
-        return {
-            "boxes": [],  # List[Tensor]
-            "scores": [],
-            "labels": [],
-        }
-```
-
 ### Prediction Alignment 策略
 
-#### 方案 A：Hungarian Matching（推薦）
-
-當 YOLO 和 Teacher 預測數量不同時：
+YOLOv11 Student 的預測與 YOLOv8 Teacher 的預測對齊。由於兩者 NMS 後的檢測數量可能不同，使用 **Hungarian Matching** 進行最優配對：
 
 ```python
 from mtkd_framework.losses import HungarianMatchingLoss
@@ -1349,124 +1487,160 @@ hungarian_loss = HungarianMatchingLoss(
     class_loss_type="kl",
 )
 
-# YOLO predictions (NMS 後，數量可變)
-yolo_pred = {
-    "boxes": yolo_outputs["boxes"],      # [B, N_yolo, 4]
-    "logits": yolo_outputs["logits"],    # [B, N_yolo, C]
-}
+# YOLOv11 Student predictions
+student_pred = yolo11_student(images)
+# student_pred["boxes"]: List[Tensor] - 每張圖 N_i 個檢測
+# student_pred["scores"]: List[Tensor]
+# student_pred["labels"]: List[Tensor]
 
-# Teacher predictions (WBF 後)
-teacher_pred = ensemble_teachers(images)  # [B, N_teacher, ...]
+# YOLOv8 Teacher predictions
+teacher_pred = yolo8_teacher(images)
+# teacher_pred["boxes"]: List[Tensor] - 每張圖 M_i 個檢測
+# teacher_pred["scores"]: List[Tensor]
+# teacher_pred["labels"]: List[Tensor]
 
-# 計算損失（自動處理不同數量的配對）
-loss, loss_dict = hungarian_loss(yolo_pred, teacher_pred)
-```
-
-#### 方案 B：Padded Matching with Mask
-
-使用 `valid_mask` 標記有效預測：
-
-```python
-from mtkd_framework.losses import PredictionAlignmentLoss
-
-loss_fn = PredictionAlignmentLoss(
-    box_loss_type="giou",
-    class_loss_type="kl",
-)
-
-# 兩邊都已 pad 到 max_detections
-loss, loss_dict = loss_fn(
-    student_predictions=yolo_pred,
-    teacher_predictions=teacher_pred,
-    valid_mask=yolo_outputs["valid_mask"] & teacher_pred["valid_mask"],
-)
+# Hungarian Matching 自動配對不同數量的預測
+# 對於每張圖，找到 min(N_i, M_i) 個最優配對
+loss, loss_dict = hungarian_loss(student_pred, teacher_pred)
+# loss_dict: {"box_loss": ..., "class_loss": ..., "total_loss": ...}
 ```
 
 ### Feature Alignment 策略
 
-#### 全局特徵對齊
+YOLOv11 Student 的 P4 特徵與 DINO Teacher 的 CLS token 對齊：
 
 ```python
-# YOLO 全局特徵（已適配到 DINO 維度）
-yolo_global = yolo_outputs["adapted_features"]  # [B, 768]
+import torch.nn.functional as F
+
+# YOLOv11 P4 特徵（已通過 adapter 投影到 768 維）
+student_features = yolo11_student(images)["adapted_features"]  # (B, 768)
 
 # DINO CLS token
-dino_cls = dino_teacher(images)["cls_token"]  # [B, 768]
+dino_output = dino_teacher(images)
+dino_cls = dino_output["cls_token"]  # (B, 768)
 
-# Cosine Loss
-feature_loss = 1 - F.cosine_similarity(yolo_global, dino_cls, dim=-1).mean()
+# Cosine Similarity Loss
+feature_loss = 1 - F.cosine_similarity(student_features, dino_cls, dim=-1).mean()
+
+# 或使用 L2 Loss
+# feature_loss = F.mse_loss(student_features, dino_cls)
 ```
 
-#### 空間特徵對齊（進階）
+**為什麼用 P4 對齊 DINO？**
 
-```python
-# YOLO P4 特徵（已適配）
-yolo_patches = yolo_outputs["adapted_spatial_features"]  # [B, 196, 768]
-
-# DINO patch tokens
-dino_patches = dino_teacher(images)["patch_tokens"]  # [B, 196, 768]
-
-# Token Matching Loss
-from mtkd_framework.losses import TokenMatchingLoss
-
-token_loss = TokenMatchingLoss(token_type="patch", loss_type="cosine")
-spatial_loss = token_loss(yolo_patches, dino_patches)
-```
+| 特徵層 | Stride | 對於 640×640 輸入 | 說明 |
+|-------|--------|------------------|------|
+| P3 | 8 | 80×80 | 太細，語義不足 |
+| **P4** | **16** | **40×40** | **與 DINO patch_size=16 對應** |
+| P5 | 32 | 20×20 | 過於抽象 |
 
 ### 完整使用範例
 
 ```python
-from mtkd_framework import MTKDModel
-from mtkd_framework.models.student_model import YOLOStudentDetector
-from ultralytics import YOLO
+import torch
+import torch.nn.functional as F
+from mtkd_framework.losses import HungarianMatchingLoss
 
-# 1. 載入 YOLO 模型
-yolo_base = YOLO("yolov8n.pt").model
+# ============================================
+# 1. 載入三個模型
+# ============================================
 
-# 2. 包裝為 YOLO Student
-yolo_student = YOLOStudentDetector(
-    yolo_model=yolo_base,
-    num_classes=1,
-    max_detections=100,
-    dino_teacher_dim=768,
-    feature_adapter_strategy="p4",
+# DINO Feature Teacher (Frozen)
+from dinov3.models import build_model as build_dino
+dino_teacher = build_dino(model_name="vit_base", patch_size=16)
+dino_teacher.load_state_dict(torch.load("dino_vitb16.pth"))
+dino_teacher.eval()
+for param in dino_teacher.parameters():
+    param.requires_grad = False
+
+# YOLOv8 Detection Teacher (Frozen)
+yolo8_teacher = YOLOv8Teacher(
+    weights_path="yolov8_stomata.pt",  # 您的預訓練 YOLOv8 權重
+    conf_threshold=0.25,
+    iou_threshold=0.45,
 )
 
-# 3. 建立 MTKD 模型（使用自定義 student）
-mtkd_model = MTKDModel(
-    custom_student=yolo_student,
-    dino_teacher_config={"model_name": "vit_base"},
-    ensemble_config={"teacher_weights": [0.6, 0.4]},
-    loss_config={
-        "feature_weight": 1.0,
-        "prediction_weight": 2.0,
-        "use_hungarian_matching": True,  # 啟用 Hungarian Matching
-    },
+# YOLOv11 Student (Trainable)
+yolo11_student = YOLOv11StudentDetector(
+    model_variant="yolo11n",
     num_classes=1,
+    dino_dim=768,
+    pretrained=True,
 )
 
-# 4. 載入預訓練權重
-mtkd_model.dino_teacher.load_pretrained("dino_vitb16.pth")
-mtkd_model.ensemble_teachers.add_teacher(teacher1, weight=0.6)
-mtkd_model.ensemble_teachers.add_teacher(teacher2, weight=0.4)
+# ============================================
+# 2. 設定損失函數
+# ============================================
 
-# 5. 訓練
+# Feature Alignment: Cosine Loss
+def feature_alignment_loss(student_feat, teacher_feat):
+    return 1 - F.cosine_similarity(student_feat, teacher_feat, dim=-1).mean()
+
+# Prediction Alignment: Hungarian Matching
+hungarian_loss = HungarianMatchingLoss(
+    box_cost_weight=5.0,
+    class_cost_weight=2.0,
+    box_loss_type="giou",
+    class_loss_type="kl",
+)
+
+# ============================================
+# 3. 訓練迴圈
+# ============================================
+
+# 只有 Student 可訓練
 optimizer = torch.optim.AdamW(
-    mtkd_model.get_trainable_parameters(),  # 只有 YOLO student 可訓練
+    yolo11_student.parameters(),
     lr=1e-4,
+    weight_decay=1e-4,
 )
+
+lambda_feat = 1.0
+lambda_pred = 2.0
 
 for epoch in range(100):
-    for images, targets in train_loader:
-        loss, loss_dict = mtkd_model.training_step(images, targets, epoch=epoch)
+    for images, _ in train_loader:
+        images = images.cuda()
 
+        # ---- Forward ----
+        # DINO: 需要 resize 到 224x224
+        dino_images = F.interpolate(images, size=(224, 224), mode="bilinear")
+        with torch.no_grad():
+            dino_out = dino_teacher(dino_images)
+            dino_cls = dino_out["cls_token"]  # (B, 768)
+
+        # YOLOv8 Teacher
+        with torch.no_grad():
+            teacher_pred = yolo8_teacher(images)
+
+        # YOLOv11 Student
+        student_out = yolo11_student(images, return_features=True)
+        student_feat = student_out["adapted_features"]  # (B, 768)
+        student_pred = {
+            "boxes": student_out["boxes"],
+            "scores": student_out["scores"],
+            "labels": student_out["labels"],
+        }
+
+        # ---- Loss ----
+        L_feature = feature_alignment_loss(student_feat, dino_cls)
+        L_prediction, pred_loss_dict = hungarian_loss(student_pred, teacher_pred)
+
+        loss = lambda_feat * L_feature + lambda_pred * L_prediction
+
+        # ---- Backward ----
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        print(f"Loss: {loss.item():.4f}")
-        print(f"  Feature Align: {loss_dict.get('feature_align_loss', 0):.4f}")
-        print(f"  Prediction Align: {loss_dict.get('pred_align_total_loss', 0):.4f}")
+        print(f"Epoch {epoch} | Loss: {loss.item():.4f}")
+        print(f"  Feature: {L_feature.item():.4f}")
+        print(f"  Prediction: {L_prediction.item():.4f}")
+
+# ============================================
+# 4. 儲存訓練好的 Student
+# ============================================
+torch.save(yolo11_student.state_dict(), "yolo11_student_mtkd.pt")
 ```
 
 ### 配置範例
@@ -1475,50 +1649,74 @@ for epoch in range(100):
 yolo_mtkd_config = {
     "model": {
         "num_classes": 1,
-        "student_type": "yolo",  # 指定使用 YOLO
-        "student_config": {
-            "yolo_variant": "yolov8n",
-            "max_detections": 100,
-            "feature_adapter_strategy": "p4",
-            "conf_threshold": 0.001,
-            "iou_threshold": 0.65,
-        },
-        "dino_teacher_config": {
+
+        # DINO Feature Teacher
+        "dino_teacher": {
             "model_name": "vit_base",
             "patch_size": 16,
             "embed_dim": 768,
+            "weights_path": "dino_vitb16.pth",
+            "frozen": True,  # 完全凍結
         },
-        "ensemble_config": {
-            "fusion_method": "wbf",
-            "fusion_config": {"iou_threshold": 0.55},
-            "teacher_weights": [0.6, 0.4],
+
+        # YOLOv8 Detection Teacher
+        "yolo8_teacher": {
+            "weights_path": "yolov8_stomata.pt",
+            "conf_threshold": 0.25,
+            "iou_threshold": 0.45,
+            "frozen": True,  # 完全凍結
         },
-        "loss_config": {
-            "feature_weight": 1.0,
-            "prediction_weight": 2.0,
-            "feature_loss_type": "cosine",
-            "prediction_loss_type": "hungarian",  # 使用 Hungarian Matching
-            "box_loss_type": "giou",
-            "class_loss_type": "kl",
-            "temperature": 4.0,
+
+        # YOLOv11 Student (Trainable)
+        "yolo11_student": {
+            "model_variant": "yolo11n",  # n/s/m/l/x
+            "pretrained": True,
+            "dino_dim": 768,
+            "conf_threshold": 0.001,  # 訓練時低閾值
+            "iou_threshold": 0.65,
         },
     },
+
+    "loss": {
+        "feature_weight": 1.0,       # λ_feat
+        "prediction_weight": 2.0,    # λ_pred
+        "feature_loss_type": "cosine",
+        "prediction_loss_type": "hungarian",
+        "box_loss_type": "giou",
+        "class_loss_type": "kl",
+    },
+
     "training": {
         "epochs": 100,
         "batch_size": 16,
         "learning_rate": 1e-4,
         "weight_decay": 1e-4,
         "warmup_epochs": 5,
+        "scheduler": "cosine",
     },
 }
 ```
 
 ### 注意事項
 
-1. **NMS 閾值**：訓練時使用較低的 `conf_threshold` (如 0.001) 以保留更多預測供對齊
-2. **特徵提取**：需要修改 YOLO 模型以輸出中間特徵，或使用 forward hooks
-3. **Box 格式**：確保 YOLO 和 Teacher 的 box 格式一致（都轉為 cxcywh normalized）
-4. **梯度流**：確保 DINO 和 Ensemble Teachers 完全凍結
+1. **圖像尺寸**：
+   - DINO 需要 224×224 輸入，需要 resize
+   - YOLO 使用 640×640（或其他標準尺寸）
+
+2. **NMS 閾值**：
+   - Teacher: 正常閾值 (conf=0.25) 產生高品質預測
+   - Student: 低閾值 (conf=0.001) 保留更多預測供配對
+
+3. **特徵提取**：
+   - 使用 forward hooks 從 YOLOv11 提取 P4 特徵
+   - P4 stride=16 與 DINO patch_size=16 對應
+
+4. **梯度流**：
+   - DINO Teacher: `requires_grad=False`
+   - YOLOv8 Teacher: `requires_grad=False`
+   - YOLOv11 Student: `requires_grad=True`（只有這個可訓練）
+
+5. **Box 格式**：Hungarian Matching 內部處理格式轉換
 
 ---
 
@@ -1533,11 +1731,12 @@ yolo_mtkd_config = {
 | **Feature Alignment Loss** | `losses/feature_alignment.py` | ✅ 完整 | L2, Cosine, KL, Smooth L1 |
 | **Prediction Alignment Loss** | `losses/prediction_alignment.py` | ✅ 完整 | GIoU, CIoU, Hungarian Matching |
 | **Combined Loss** | `losses/combined_loss.py` | ✅ 完整 | 標準版 + Adaptive + Uncertainty |
-| **Student Model** | `models/student_model.py` | ✅ 完整 | DETR-like 架構 |
+| **Student Model (DETR)** | `models/student_model.py` | ✅ 完整 | DETR-like 架構 |
 | **Teacher Ensemble** | `models/teacher_ensemble.py` | ✅ 完整 | WBF + Soft-NMS |
 | **MTKD Model** | `models/mtkd_model.py` | ✅ 完整 | 整合所有組件 |
 | **Training Pipeline** | `train.py` | ✅ 完整 | MTKDTrainer 類別 |
-| **YOLO Student** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
+| **YOLOv8Teacher** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
+| **YOLOv11StudentDetector** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
 
 ---
 
