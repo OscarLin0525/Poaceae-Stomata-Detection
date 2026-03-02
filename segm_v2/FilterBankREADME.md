@@ -1,0 +1,2852 @@
+# SEGM v2: Spatially-Elastic Grid Modulation
+## Row-wise Adaptive Multi-Frequency for Stomata Detection
+
+---
+
+> ⚠️ **實作狀態：規劃中 (Planning Stage)**
+>
+> 本文件為技術規格書，詳細描述 SEGM v2 的設計架構和實作計劃。
+>
+> | 狀態 | 說明 |
+> |------|------|
+> | 📄 **規格文件** | ✅ 已完成 |
+> | 🔧 **Python 實作** | ❌ 尚未開始 |
+> | 🧪 **測試驗證** | ❌ 尚未開始 |
+>
+> **待實作的模組**（將放在 `dinov3-main/segm_v2/`）：
+> - `models/segm_vision_transformer.py` - 繼承 DINOv3 的主模型
+> - `models/segm_adapter.py` - Block 間的 SEGM 適配器
+> - `models/frequency_estimator.py` - Row-wise FFT 頻率估計
+> - `models/grid_generator.py` - 週期性 Grid 生成
+> - `losses/unsupervised_loss.py` - 自監督損失函數
+> - `train.py` - 訓練腳本
+
+---
+
+## 目錄
+
+1. [專案概述](#1-專案概述)
+   - 1.4 [⭐ SEGM 插入位置（重要）](#14--segm-插入位置重要)
+2. [問題背景](#2-問題背景)
+3. [DINOv3 程式碼結構分析](#3-dinov3-程式碼結構分析)
+4. [整合方案設計](#4-整合方案設計)
+5. [核心模組規格](#5-核心模組規格)
+   - 5.5 [處理不完美週期性的策略（A/B/C/D）](#55-處理不完美週期性的策略)
+   - 5.6 [推薦方案：A + C + Soft Modulation](#56-推薦方案a--c--soft-modulation)
+6. [損失函數設計](#6-損失函數設計)（DINO 無法檢測 stomata 的應對策略）
+7. [訓練配置](#7-訓練配置)
+8. [實作檢查清單](#8-實作檢查清單)
+
+**附錄**
+- [附錄 A：DINOv3 關鍵程式碼參考](#附錄-adinov3-關鍵程式碼參考)
+- [附錄 B：與原 SPEC 的差異](#附錄-b與原-spec-的差異)
+- [附錄 C：程式碼驗證來源](#附錄-c程式碼驗證來源)
+- [附錄 D：實作注意事項](#附錄-d實作注意事項)
+- [附錄 E：總結與推薦配置](#附錄-e總結與推薦配置)
+- [附錄 F：完整實作程式碼](#附錄-f完整實作程式碼)（可直接使用）
+
+---
+
+## 1. 專案概述
+
+### 1.1 目標
+
+利用氣孔（Stomata）的**水平週期性排列規律**作為先驗知識，在 DINO 的中間層引導特徵提取，降低 noise 干擾。
+
+### 1.2 核心觀察
+
+```
+禾本科植物葉片的氣孔排列：
+
+Row 0:  ░░░█░░░░░█░░░░░█░░░░░█░░░   ← 有 stomata，頻率 f₀
+Row 1:  ░░░░░░░░░░░░░░░░░░░░░░░░░   ← 無 stomata
+Row 2:  ░░█░░░░█░░░░█░░░░█░░░░█░░   ← 有 stomata，頻率 f₂ (可能 ≠ f₀)
+Row 3:  ░░░░░░░░░░░░░░░░░░░░░░░░░   ← 無 stomata
+Row 4:  ░░░░█░░░░░█░░░░░░█░░░░░█░   ← 有 stomata，偶爾漏掉
+```
+
+**特性**：
+- 同一水平行內，stomata 大致週期性出現
+- 不同行的頻率可能不同
+- 不是完美週期，偶爾會少
+
+### 1.3 設計原則
+
+| 原則 | 說明 |
+|-----|------|
+| **不修改 DINOv3 原始碼** | 使用組合或繼承 |
+| **凍結預訓練權重** | 只訓練 SEGM 參數 |
+| **Zero-Init Gate** | 初始時不影響 DINO 輸出 |
+| **Unsupervised** | 不需要標註資料 |
+
+### 1.4 ⭐ SEGM 插入位置（重要）
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        DINOv3 ViT-Base 架構                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Input Image                                                             │
+│       ↓                                                                  │
+│  Patch Embed + CLS Token                                                │
+│       ↓                                                                  │
+│  ┌─────────┐                                                            │
+│  │ Block 0 │ ─────────────────────────────────────────┐                 │
+│  └─────────┘                                          │                 │
+│       ↓                                               │                 │
+│  ┌─────────┐                                          │                 │
+│  │ Block 1 │                                          │ 凍結            │
+│  └─────────┘                                          │ (Frozen)        │
+│       ↓                                               │                 │
+│      ...                                              │                 │
+│       ↓                                               │                 │
+│  ┌──────────┐                                         │                 │
+│  │ Block 10 │ ←── 倒數第 2 層                         │                 │
+│  └──────────┘                                         ┘                 │
+│       ↓                                                                  │
+│  ╔═══════════════════════════════════════════════════════════════════╗  │
+│  ║                     ⭐ SEGM 插入點 ⭐                              ║  │
+│  ║                                                                    ║  │
+│  ║  patch_tokens ─→ [頻率估計] ─→ [Grid生成] ─→ [調變] ─→ enhanced   ║  │
+│  ║                      ↓              ↓                              ║  │
+│  ║               Row-wise FFT    週期性 Grid                          ║  │
+│  ║                                                                    ║  │
+│  ║  📍 位置: Block 10 之後, Block 11 之前                             ║  │
+│  ║  📍 程式碼: segm_after_blocks=[10]                                 ║  │
+│  ║  📍 可訓練參數: 只有 SEGM（約 2M 參數）                            ║  │
+│  ╚═══════════════════════════════════════════════════════════════════╝  │
+│       ↓                                                                  │
+│  ┌──────────┐                                         ┐                 │
+│  │ Block 11 │ ←── 受到 SEGM 引導                      │ 凍結            │
+│  └──────────┘                                         │ (Frozen)        │
+│       ↓                                               │                 │
+│  ┌──────────┐                                         │                 │
+│  │ Block 12 │ ←── 最後一層，也受益                    │                 │
+│  └──────────┘                                         ┘                 │
+│       ↓                                                                  │
+│  Layer Norm                                                              │
+│       ↓                                                                  │
+│  Output Features (已被週期性引導增強)                                    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**關鍵說明**：
+
+| 項目 | 說明 |
+|-----|------|
+| **插入位置** | Block 10 輸出之後，Block 11 輸入之前 |
+| **Block 索引** | `segm_after_blocks=[10]`（0-indexed，第 11 個 Block） |
+| **為什麼選這裡** | 讓 Block 11, 12 都能受到週期性引導 |
+| **實作方式** | 繼承 `DinoVisionTransformer`，覆寫 `forward_features_list` |
+| **凍結狀態** | DINO 全部凍結，只訓練 SEGM 模組 |
+
+### 1.5 ⭐ 理論基礎與關鍵洞察
+
+#### 為什麼此設計有效（即使 DINO 無法區分單個 stomata）
+
+**常見誤解**：「DINO 特徵無法區分 stomata 和 noise，所以 FilterBank 無法工作」
+
+**正確理解**：L_intra 依賴的是 **群體一致性（Group Consistency）**，而非單個特徵的區分度
+
+```
+Individual level（單個樣本）:
+  stomata_feature ≈ noise_feature  ← 難以區分 ❌
+
+Group level（群體）:
+  {stomata_1, stomata_2, stomata_3} → 高度一致（同一類物體）✓
+  {reflection, cell_wall, vein}    → 不一致（不同類物體）✗
+```
+
+**關鍵洞察**：
+
+| 場景 | 峰值位置包含 | 特徵一致性 | L_intra |
+|-----|------------|----------|---------|
+| Grid 對到 stomata | 全是 stomata | 高（同類物體） | **低** ✓ |
+| Grid 對到 noise | 各種 noise 混合 | 低（不同類物體） | **高** ✗ |
+| Grid 對到混合 | stomata + noise | 中等 | **中等** ✗ |
+
+**訓練機制**：
+```
+初始: FFT 估計頻率 → 生成初始 Grid（可能不準）
+  ↓
+L_intra 檢查: 峰值位置的特徵是否一致？
+  ↓
+如果不一致 → Loss 高 → 梯度調整 Grid 參數（頻率、相位）
+  ↓
+迭代收斂 → Grid 對齊到「特徵最一致」的週期性位置（= stomata）
+```
+
+#### L_intra 有效的前提條件
+
+```python
+# 核心假設：stomata 群體一致性 > noise 群體一致性
+
+# 驗證方法（訓練前建議執行）
+stomata_features = dino_features[stomata_positions]  # 人工標記幾個
+noise_features = dino_features[noise_positions]      # 反光、葉脈、細胞壁等
+
+stomata_consistency = pairwise_cosine_sim(stomata_features).mean()
+noise_consistency = pairwise_cosine_sim(noise_features).mean()
+
+assert stomata_consistency > noise_consistency, "假設不成立，需重新設計"
+```
+
+#### 14×14 FFT 解析度的考量
+
+**問題**：14 點 FFT 只有 7 個頻率 bin，解析度很粗
+
+**為什麼仍可行**：
+1. FFT 只是提供**初始方向**，不需要精確
+2. **Loss 函數做最終調整**：L_intra 會 fine-tune Grid 到正確位置
+3. 週期性約束限制解空間：Grid 必須是週期的，防止任意變形
+
+```
+FFT 角色: 粗略估計 → "大約每 3-5 個 patch 有一個 stomata"
+Loss 角色: 精確調整 → "具體在哪個相位，哪個確切頻率"
+```
+
+#### 與 MTKD 框架的整合
+
+FilterBank-enhanced DINO 可以與 MTKD 框架結合：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          MTKD + FilterBank                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Input Image                                                         │
+│       │                                                              │
+│       ├────────────────┬────────────────┬────────────────┐          │
+│       │                │                │                │          │
+│       ▼                ▼                ▼                ▼          │
+│  ┌─────────┐    ┌─────────────┐   ┌──────────┐   ┌──────────┐      │
+│  │  DINO   │    │ DINO +      │   │ YOLOv8   │   │ YOLOv11  │      │
+│  │(原始)   │    │ FilterBank  │   │ Teacher  │   │ Student  │      │
+│  │         │    │(週期性增強)  │   │ (Frozen) │   │(Trainable)│      │
+│  └────┬────┘    └──────┬──────┘   └────┬─────┘   └────┬─────┘      │
+│       │                │               │              │             │
+│       │         Enhanced Features      │         Predictions        │
+│       │         (週期性區域強化)        │              │             │
+│       │                │               │              │             │
+│       │                └───────┬───────┘              │             │
+│       │                        │                      │             │
+│       │                        ▼                      ▼             │
+│       │              ┌─────────────────────────────────────┐        │
+│       │              │           MTKD Loss                 │        │
+│       │              │                                     │        │
+│       │              │  Feature Align: YOLO11 ↔ Enhanced   │        │
+│       │              │  Pred Align: YOLO11 ↔ YOLO8         │        │
+│       │              └─────────────────────────────────────┘        │
+│       │                                                              │
+│       │   訓練效果:                                                  │
+│       │   - YOLO11 學習對齊 Enhanced Features                        │
+│       │   - Enhanced Features 強調週期性區域（真 stomata）            │
+│       │   - YOLO11 因此偏好週期性位置 → 減少 False Positives          │
+│       │                                                              │
+└───────┴──────────────────────────────────────────────────────────────┘
+```
+
+**整合邏輯**：
+1. YOLOv8 Teacher 提供預測（含 stomata + noise）
+2. FilterBank-enhanced DINO 提供特徵（週期性區域被強化）
+3. YOLOv11 Student 同時對齊兩者
+4. 由於 Enhanced Features 強調週期性，Student 學會偏好週期性位置
+5. 結果：Student 的 False Positives 減少
+
+---
+
+## 2. 問題背景
+
+### 2.1 現有問題
+
+DINO 的 attention heatmap 抓到太多 noise（反光、葉脈、細胞壁等），導致難以準確檢測 stomata。
+
+### 2.2 為什麼要在內部插入？
+
+```
+Post-process 方案：
+┌─────────────────────────────────────────────────────────┐
+│ Block 1 → ... → Block 12 → [已經有 noise 的輸出]       │
+│                                      ↓                  │
+│                                Post-process             │
+│                                (只能過濾，無法引導)     │
+└─────────────────────────────────────────────────────────┘
+
+Internal 插入方案：
+┌─────────────────────────────────────────────────────────┐
+│ Block 1 → ... → Block 10 → [SEGM 引導] → Block 11-12   │
+│                                  ↓                      │
+│                   引導後續層關注週期性位置               │
+│                                  ↓                      │
+│                          更乾淨的最終輸出               │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. DINOv3 程式碼結構分析
+
+> 以下分析基於實際程式碼 `dinov3-main/dinov3/`
+
+### 3.1 DinoVisionTransformer 類別結構
+
+**檔案**：`models/vision_transformer.py`
+
+```
+DinoVisionTransformer(nn.Module)
+├── patch_embed: PatchEmbed
+├── cls_token: Parameter (1, 1, embed_dim)
+├── storage_tokens: Parameter (1, n_storage, embed_dim)  # 可選
+├── rope_embed: RopePositionEmbedding
+├── blocks: ModuleList[SelfAttentionBlock]  # depth 個
+├── norm: LayerNorm
+├── cls_norm: LayerNorm  # 可選
+└── mask_token: Parameter (1, embed_dim)
+```
+
+**關鍵屬性**：
+
+| 屬性 | ViT-Base 值 | 說明 |
+|-----|------------|------|
+| `embed_dim` | 768 | 特徵維度 |
+| `n_blocks` / `depth` | 12 | Block 數量 |
+| `num_heads` | 12 | Attention heads |
+| `patch_size` | 16 | Patch 大小 |
+| `n_storage_tokens` | 0 | Storage tokens 數量（預設 0） |
+
+### 3.2 Token 處理流程
+
+**方法**：`prepare_tokens_with_masks` (lines 190-220)
+
+```
+輸入: x (B, 3, H_img, W_img)
+  ↓ patch_embed
+(B, H, W, C)  # H = H_img/patch_size, W = W_img/patch_size
+  ↓ flatten(1, 2)
+(B, H×W, C)
+  ↓ cat([cls_token, storage_tokens, x])
+(B, 1 + n_storage + H×W, C)
+
+輸出: (tokens, (H, W))
+```
+
+**範例**（ViT-Base, 224×224 輸入）：
+
+| 階段 | Shape | 說明 |
+|-----|-------|------|
+| 原始圖像 | (B, 3, 224, 224) | RGB |
+| patch_embed 後 | (B, 14, 14, 768) | 14 = 224/16 |
+| flatten 後 | (B, 196, 768) | 196 = 14×14 |
+| 加 CLS 後 | (B, 197, 768) | +1 for CLS |
+
+### 3.3 forward_features_list 方法
+
+**檔案**：`vision_transformer.py` (lines 222-261)
+
+```python
+def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]):
+    # 1. 準備 tokens
+    x = []
+    rope = []
+    for t_x, t_masks in zip(x_list, masks_list):
+        t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
+        x.append(t2_x)
+        rope.append(hw_tuple)  # rope 存的是 (H, W) tuple！
+
+    # 2. Block 迴圈
+    for _, blk in enumerate(self.blocks):  # ⚠️ index 被丟棄
+        if self.rope_embed is not None:
+            rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+        else:
+            rope_sincos = [None for r in rope]
+        x = blk(x, rope_sincos)  # x 是 List[Tensor]！
+
+    # 3. Norm 和輸出
+    ...
+```
+
+**重要發現**：
+
+| 項目 | 說明 |
+|-----|------|
+| `x` 是 **List[Tensor]** | 不是單一 Tensor，因為要支援 multi-crop |
+| `rope` 存 **(H, W) tuples** | 不是 position embeddings |
+| Block 迴圈的 index 被丟棄 | 原始程式碼用 `for _, blk in enumerate(...)` |
+
+### 3.4 SelfAttentionBlock 結構
+
+**檔案**：`layers/block.py` (lines 21-212)
+
+```python
+class SelfAttentionBlock(nn.Module):
+    def forward(self, x_or_x_list, rope_or_rope_list=None):
+        if isinstance(x_or_x_list, Tensor):
+            # 單一 tensor：包成 list 處理
+            return self._forward_list([x_or_x_list], [rope_or_rope_list])[0]
+        elif isinstance(x_or_x_list, list):
+            # List of tensors
+            return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list)
+```
+
+**輸入輸出格式**：
+- 輸入：`List[Tensor]`，每個 tensor 是 `(B, N, C)`
+- 輸出：`List[Tensor]`，同樣格式
+
+### 3.5 Attention 機制
+
+**檔案**：`layers/attention.py` (lines 106-118)
+
+```python
+def compute_attention(self, qkv, attn_bias=None, rope=None):
+    ...
+    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # Flash Attention
+    ...
+```
+
+**限制**：使用 Flash Attention，**無法直接提取 attention weights**。
+
+### 3.6 現有 Adapter 設計參考
+
+**檔案**：`eval/segmentation/models/backbone/dinov3_adapter.py`
+
+DINOv3 官方的 Adapter 使用：
+- **組合**而非繼承
+- 凍結 backbone：`self.backbone.requires_grad_(False)`
+- 使用 `get_intermediate_layers` API 提取中間層特徵
+
+---
+
+## 4. 整合方案設計
+
+### 4.1 方案比較
+
+| 方案 | 優點 | 缺點 |
+|-----|------|------|
+| **A: 繼承 + 覆寫** | 完全控制 forward | 需要複製大量程式碼 |
+| **B: 組合 + Hooks** | 不修改原始碼 | Hook 機制較複雜 |
+| **C: 組合 + 外部處理** | 最簡單 | 只能 post-process |
+
+**建議：方案 A（繼承 + 覆寫）**
+
+理由：
+1. 需要在 Block 之間插入 SEGM，而非只是提取特徵
+2. Hook 機制雖可行但較複雜
+3. 官方的 Adapter 是 post-process，不符合我們的需求
+
+### 4.2 方案 A 詳細設計
+
+#### 4.2.1 類別繼承
+
+```
+DinoVisionTransformer (dinov3-main)
+         │
+         ▼
+SEGMDinoVisionTransformer (segm_v2)
+    - 覆寫 forward_features_list()
+    - 新增 segm_modules: ModuleDict
+    - 新增 _apply_segm() 方法
+```
+
+#### 4.2.2 需要覆寫的方法
+
+`forward_features_list`：修改 Block 迴圈，加入 index 追蹤和 SEGM 插入點
+
+```python
+# 原始（vision_transformer.py:229-234）
+for _, blk in enumerate(self.blocks):
+    ...
+    x = blk(x, rope_sincos)
+
+# 修改後
+for blk_idx, blk in enumerate(self.blocks):
+    ...
+    x = blk(x, rope_sincos)
+    if blk_idx in self.segm_after_blocks:
+        x = self._apply_segm(x, blk_idx, rope)
+```
+
+#### 4.2.3 SEGM 插入位置
+
+| 位置 | Block Index | 說明 |
+|-----|-------------|------|
+| Block 10 之後 | 10 | 讓 Block 11, 12 都受益（**推薦**） |
+| Block 11 之後 | 11 | 只影響最後一層 |
+
+#### 4.2.4 _apply_segm 方法設計
+
+```
+輸入:
+  - x_list: List[Tensor]，每個 (B, N, C) 其中 N = 1 + n_storage + H×W
+  - blk_idx: int
+  - rope: List[(H, W)]
+
+處理:
+  for x, (H, W) in zip(x_list, rope):
+      1. 分離 prefix tokens 和 patch tokens
+         prefix = x[:, :1+n_storage, :]
+         patches = x[:, 1+n_storage:, :]
+
+      2. SEGM 處理 patch tokens
+         enhanced = segm_module(patches, H, W)
+
+      3. 重新組合
+         x = cat([prefix, enhanced])
+
+輸出:
+  - enhanced_x_list: List[Tensor]，格式同輸入
+```
+
+### 4.3 檔案結構
+
+```
+Poaceae-Stomata-Detection/
+├── dinov3-main/                           # 不修改
+│   └── dinov3/
+│       ├── models/vision_transformer.py   # 參考
+│       └── layers/
+│           ├── block.py                   # 參考
+│           └── attention.py               # 參考
+│
+├── segm_v2/
+│   ├── __init__.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── segm_vision_transformer.py     # 繼承 DinoVisionTransformer
+│   │   ├── segm_adapter.py                # SEGM 核心模組
+│   │   ├── frequency_estimator.py         # Row-wise FFT
+│   │   └── grid_generator.py              # 週期性 Grid 生成
+│   ├── losses/
+│   │   ├── __init__.py
+│   │   └── unsupervised_loss.py
+│   └── train.py
+│
+└── configs/
+    └── segm_v2_config.yaml
+```
+
+---
+
+## 5. 核心模組規格
+
+### 5.1 SEGMAdapter
+
+**職責**：在 Block 之間處理 patch tokens，加入週期性調變
+
+#### 輸入輸出
+
+| 項目 | 格式 | 說明 |
+|-----|------|------|
+| **輸入** | `(B, H×W, C)` | 只有 patch tokens |
+| | `H, W: int` | 來自 rope tuple |
+| **輸出** | `(B, H×W, C)` | 增強後的 tokens |
+| | `grid: (B, H, W)` | 週期性 Grid（用於 loss） |
+| | `freq_info: dict` | 頻率估計資訊（用於 loss） |
+
+#### 內部流程
+
+```
+輸入 patch_tokens (B, H×W, C)
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 1. Reshape to Spatial                   │
+│    (B, H×W, C) → view → (B, H, W, C)   │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 2. Row-wise Frequency Estimation        │
+│    對每一行做 1D FFT，估計主頻率         │
+│    輸出: dominant_freq (B, H)           │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 3. Periodic Grid Generation             │
+│    根據 freq 生成週期性 Grid            │
+│    輸出: grid (B, 1, H, W)             │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 4. Channel Projection                   │
+│    1×1 Conv: (B, 1, H, W) → (B, C, H, W)│
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ 5. Gated Residual                       │
+│    output = input + gate × delta        │
+│    gate 初始化為 0                       │
+└─────────────────────────────────────────┘
+         │
+         ▼
+輸出 enhanced_tokens (B, H×W, C)
+```
+
+#### 參數
+
+| 參數 | 類型 | 預設值 | 說明 |
+|-----|------|-------|------|
+| `embed_dim` | int | 768 | 特徵維度 |
+| `num_freq_bins` | int | 32 | FFT 頻率 bin 數量 |
+| `hidden_dim` | int | 256 | 頻率估計的隱藏維度 |
+
+### 5.2 RowFrequencyEstimator
+
+**職責**：對每一行進行頻率分析，估計水平方向的週期性
+
+#### 輸入輸出
+
+| 項目 | 格式 | 說明 |
+|-----|------|------|
+| **輸入** | `(B, H, W, C)` | 空間格式特徵 |
+| **輸出** | `dominant_freq: (B, H)` | 每行主頻率，範圍 [0, 1] |
+| | `freq_spectrum: (B, H, num_bins)` | 完整頻譜 |
+
+#### 處理流程
+
+```
+1. Feature Projection
+   (B, H, W, C) → MLP → (B, H, W, hidden_dim)
+
+2. Row-wise 1D rFFT
+   對每行沿 W 方向做 FFT
+   (B, H, W, hidden_dim) → (B, H, hidden_dim, W//2+1) [complex]
+
+3. Power Spectrum
+   magnitude² → mean over hidden_dim → (B, H, W//2+1)
+
+4. Interpolate to fixed bins
+   (B, H, W//2+1) → (B, H, num_freq_bins)
+
+5. Find Dominant Frequency
+   argmax (排除 DC) → normalize to [0, 1]
+```
+
+#### 「某行沒有 stomata」的處理
+
+當某行沒有明顯週期性時，FFT 會估出 noise。處理方式：
+
+| 策略 | 說明 |
+|-----|------|
+| **能量閾值** | 若總能量低於閾值，頻率設為 0 |
+| **相鄰行平滑** | 用相鄰行的頻率做 weighted average |
+| **可學習濾波器** | 讓模型學習哪些頻率是重要的 |
+
+### 5.3 PeriodicGridGenerator
+
+**職責**：根據估計的頻率生成週期性 Grid
+
+#### 輸入輸出
+
+| 項目 | 格式 | 說明 |
+|-----|------|------|
+| **輸入** | `dominant_freq: (B, H)` | 每行頻率 |
+| | `H, W: int` | 空間維度 |
+| **輸出** | `grid: (B, 1, H, W)` | 週期性 Grid，值域 [0, 1] |
+
+#### Grid 生成公式
+
+**Power Cosine Wave**：
+
+$$
+\text{Wave}(t; f, \phi, \kappa) = \left( \frac{\cos(2\pi f t + \phi) + 1}{2} \right)^\kappa
+$$
+
+其中：
+- $f$：頻率（來自 FFT 估計）
+- $\phi$：相位（可學習參數）
+- $\kappa$：尖銳度（控制波峰寬度）
+
+**特性**：
+- $\kappa = 1$：標準餘弦波
+- $\kappa > 1$：波峰變尖（對應更精確的位置）
+- $\kappa \to \infty$：趨近脈衝
+
+**2D Grid 生成**：
+
+```
+Row wave: R(x, h) = Wave(x; freq[h], phase[h], κ)
+Col wave: C(y) = Wave(y; freq_col, phase_col, κ)  # 全局參數
+Grid: G(x, y, h) = R(x, h) × C(y)
+```
+
+#### 可學習參數
+
+| 參數 | Shape | 初始化 | 說明 |
+|-----|-------|--------|------|
+| `row_phase` | (1, max_H) | Uniform(-π, π) | 每行的相位 |
+| `col_freq` | (1,) | 0 | 列方向頻率 |
+| `col_phase` | (1,) | 0 | 列方向相位 |
+| `kappa` | (1,) | 0 | 尖銳度（經 softplus） |
+
+### 5.4 Gate 機制
+
+**目的**：確保訓練初期 SEGM 不影響 DINO 原始輸出
+
+```
+output = input + gate × delta
+```
+
+**gate 初始化**：
+
+| 方式 | 初始值 | 初始效果 |
+|-----|-------|---------|
+| 直接用 α | 0 | output = input |
+| sigmoid(α) | 0 → 0.5 | output = input + 0.5 × delta（不好） |
+
+**建議**：直接使用 `gate = nn.Parameter(torch.zeros(1))`，不經過 sigmoid。
+
+### 5.5 處理不完美週期性的策略
+
+**問題背景**：根據實際 Ground Truth 觀察，Stomata 的週期性並非完美規律：
+
+```
+實際觀察（Ground Truth 分析）：
+
+Row 0: ░░█░░░░█░░░█░░░░█░░░   ← 週期約 4-5，但有 jitter
+Row 1: ░░░░░░░░░░░░░░░░░░░░░   ← 無 stomata（空行）
+Row 2: ░█░░░█░░░░█░░░█░░░░█░   ← 週期約 3-4，與 Row 0 不同
+Row 3: ░░░░░░░░░░░░░░░░░░░░░   ← 無 stomata（空行）
+Row 4: ░░░█░░░░█░░░░░█░░░█░░   ← 週期約 4，偶爾缺失
+
+特性總結：
+├── 水平方向：離散分布 [stomata ─ 間隔 ─ stomata ─ 間隔 ─ ...]
+├── 每行頻率不同：有的行密集，有的稀疏
+├── 對齊不標準：同行內間距有 ±20% jitter
+├── 有些行無 stomata：垂直方向也有規律（stomata row / empty row 交替）
+└── 偶爾缺失：某些預期位置沒有 stomata
+```
+
+**不完美週期性的類型**：
+
+| 類型 | 說明 | 影響 |
+|-----|------|------|
+| **Phase Jitter** | 位置偏移 ±20% | Grid 峰值可能偏離實際位置 |
+| **Frequency Variation** | 每行頻率不同 | 需要 per-row 頻率估計 |
+| **Missing Stomata** | 偶爾缺失 | Grid 峰值處可能沒有 stomata |
+| **Empty Rows** | 整行無 stomata | 該行的 Grid 應該全暗 |
+
+**提供四種策略（A, B, C, D），建議組合使用**：
+
+#### 方案 A：寬鬆峰值（Wide Peaks）— 推薦
+
+**原理**：使用較低的 κ 值，讓波峰更寬、更容忍位置偏差
+
+```
+κ = 1：標準餘弦波（較寬）
+κ = 5：中等尖銳
+κ = 10：較尖銳
+κ → ∞：趨近脈衝（無容忍度）
+```
+
+**建議**：初始 κ = 1~2，讓模型自己學習調整
+
+**優點**：
+- 實作簡單
+- 容忍 ±20-30% 的位置偏差
+- 可學習最佳寬度
+
+**缺點**：
+- 可能納入過多 noise
+
+#### 方案 B：頻率帶通（Frequency Band-pass）— Phase-Invariant
+
+**原理**：不要求精確位置對齊，只要求「該頻率成分存在」
+
+```
+不用 Grid 直接 mask，改用頻域操作：
+
+1. 對特徵做 row-wise FFT
+2. 只保留估計頻率 ± Δf 範圍的成分
+3. 逆 FFT 回空間域
+```
+
+**數學表達**：
+
+$$
+\hat{X}[f] = \begin{cases} X[f] \cdot w(f) & \text{if } |f - f_{\text{estimated}}| < \Delta f \\ X[f] \cdot \epsilon & \text{otherwise} \end{cases}
+$$
+
+其中 $w(f)$ 是平滑權重，$\epsilon$ 是小值（如 0.1）
+
+**優點**：
+- 完全不受 phase 影響
+- 數學上更 principled
+
+**缺點**：
+- 失去空間位置信息
+- 可能過度平滑
+
+#### 方案 C：統計先驗（Statistical/Probabilistic Prior）— 推薦
+
+**原理**：不做 hard modulation，而是用統計量來正則化
+
+```
+1. 計算每行的頻率分布 p(f)
+2. 計算週期性「強度」: strength = max(p) / mean(p)
+3. 只在 strength > threshold 時強化該頻率
+```
+
+**實作思路**：
+
+```python
+# 計算 periodicity score（不依賴精確 phase）
+fft_power = torch.abs(torch.fft.rfft(features, dim=-1))
+peak_power = fft_power.max(dim=-1)
+mean_power = fft_power.mean(dim=-1)
+periodicity_score = peak_power / (mean_power + eps)
+
+# 只在週期性明顯時才施加調變
+weight = sigmoid((periodicity_score - threshold) * temperature)
+output = input * (1 + gate * weight * delta)
+```
+
+**優點**：
+- 更穩健
+- 自動處理「無週期性」的行
+
+**缺點**：
+- 需要額外的 threshold tuning
+
+#### 方案 D：特徵引導細化（Feature-Guided Refinement）
+
+**原理**：用 Grid 的初步估計來找 candidate 位置，再用特徵相似度細化
+
+```
+1. 生成初步 Grid（寬峰）
+2. 在 Grid 峰值附近搜索（±2 pixels）
+3. 選擇特徵最一致的位置
+```
+
+**優點**：
+- 結合頻率先驗和特徵信息
+
+**缺點**：
+- 計算較複雜
+- 若特徵本身有 noise，可能失效
+
+### 5.6 推薦方案：A + C + Soft Modulation
+
+**組合策略**：
+
+1. **寬峰（A）**：κ = 1~2，容忍位置偏差
+2. **統計先驗（C）**：只在週期性明顯時調變
+3. **Soft Modulation**：不做 hard masking，用加權調變
+
+**Soft Modulation 實作**：
+
+```python
+# 取代 hard modulation
+# 原本: output = input + gate * delta
+
+# Soft attention modulation
+attention_weight = sigmoid(grid * temperature)  # temperature 控制尖銳度
+output = input * (1 + gate * attention_weight * scale)
+
+# 或者加性版本
+output = input + gate * attention_weight * delta
+```
+
+**參數建議**：
+
+| 參數 | 建議值 | 說明 |
+|-----|-------|------|
+| κ (kappa) | 1.0 ~ 2.0 | 初始寬峰 |
+| temperature | 5.0 ~ 10.0 | Soft modulation 尖銳度 |
+| periodicity_threshold | 2.0 | 週期性強度閾值 |
+| Δf (頻率容忍) | ±10% | 若使用方案 B |
+
+---
+
+## 6. 損失函數設計
+
+### 6.1 核心挑戰：DINO 無法檢測 Stomata
+
+**重要發現**：經過實際測試，DINO **幾乎無法檢測 stomata**。
+
+**原因分析**：
+
+| 問題 | 說明 |
+|-----|------|
+| 背景 noise 與 stomata 外觀相似 | 反光、細胞壁等與 stomata 在特徵空間中相似 |
+| Flash Attention 無法提取 weights | 無法用 attention heatmap 作為監督 |
+| 特徵相似度不可靠 | CLS-patch similarity 無法區分 stomata 和 noise |
+
+**結論**：不能依賴 DINO 的特徵來定位 stomata。必須**純粹依賴週期性先驗**。
+
+**設計原則**：
+- Stomata 是週期性排列的
+- Noise 是隨機分布的
+- 利用這個區別來過濾 noise
+
+### 6.2 損失函數列表（修正版）
+
+| Loss | 目的 | 權重 | 說明 |
+|-----|------|------|------|
+| **L_intra** | Grid 峰值位置的特徵一致性 | 1.0 | 同類物體特徵應相似 |
+| **L_inter** | 峰值 vs 谷值的特徵區分度 | 1.0 | 前景/背景應不同 |
+| **L_period** | Grid 應保持週期性 | 0.5 | 防止退化 |
+| **L_freq_smooth** | 相鄰行頻率連續性 | 0.5 | 空間平滑 |
+| **L_sparse** | Grid 稀疏性 | 0.1 | 防止全亮 |
+
+### 6.3 各項損失詳解
+
+#### L_intra: Intra-Peak Consistency Loss（核心）
+
+**目的**：Grid 峰值位置的特徵應該彼此相似（因為都是 stomata）
+
+**直覺**：如果 Grid 正確標記了 stomata 位置，這些位置的特徵應該是一致的
+
+**⭐ 群體一致性原理**：
+
+```
+關鍵洞察：L_intra 利用的是「群體一致性」而非「個體區分度」
+
+即使單個 stomata 特徵 ≈ 單個 noise 特徵（難以區分）
+但是：
+  - Stomata 群體 = {stomata_1, stomata_2, ...} → 都是同類物體 → 彼此相似
+  - Noise 群體 = {反光, 葉脈, 細胞壁, ...} → 不同類物體 → 彼此不相似
+
+因此：
+  - Grid 對到 stomata → 峰值特徵群體一致性高 → L_intra 低 ✓
+  - Grid 對到 noise → 峰值特徵群體一致性低 → L_intra 高 ✗
+```
+
+**計算方式**：
+
+```python
+# 1. 找出 Grid 峰值位置（top-k 或 threshold）
+peak_mask = (grid > threshold)  # (B, H, W)
+
+# 2. 提取峰值位置的特徵
+peak_features = features[peak_mask]  # (N_peaks, C)
+
+# 3. 計算峰值特徵之間的相似度矩陣
+sim_matrix = cosine_similarity(peak_features, peak_features)  # (N_peaks, N_peaks)
+
+# 4. 最大化平均相似度（排除對角線）
+mask = ~torch.eye(N_peaks, dtype=bool)
+L_intra = -sim_matrix[mask].mean()
+```
+
+$$
+\mathcal{L}_{\text{intra}} = -\frac{1}{N(N-1)} \sum_{i \neq j} \cos(\mathbf{f}_i^{\text{peak}}, \mathbf{f}_j^{\text{peak}})
+$$
+
+**注意**：這個 loss 不依賴 DINO 能否檢測 stomata，只要求「被選中的位置特徵一致」
+
+**⚠️ 前提條件驗證**：
+
+```python
+# 訓練前建議執行此驗證，確認假設成立
+def verify_group_consistency(dino_model, image, stomata_positions, noise_positions):
+    """
+    驗證 stomata 群體一致性 > noise 群體一致性
+
+    Args:
+        stomata_positions: 人工標記的幾個 stomata 位置 [(x1,y1), (x2,y2), ...]
+        noise_positions: 人工標記的幾個 noise 位置（反光、葉脈、細胞壁等）
+    """
+    with torch.no_grad():
+        features = dino_model(image)['x_norm_patchtokens']  # (1, 196, 768)
+        features = features.view(1, 14, 14, 768)
+
+        # 轉換座標到 feature map 空間
+        stomata_feats = [features[0, y//16, x//16, :] for (x, y) in stomata_positions]
+        noise_feats = [features[0, y//16, x//16, :] for (x, y) in noise_positions]
+
+        stomata_feats = torch.stack(stomata_feats)  # (N_stomata, 768)
+        noise_feats = torch.stack(noise_feats)      # (N_noise, 768)
+
+        # 計算群體內的 pairwise similarity
+        stomata_sim = F.cosine_similarity(
+            stomata_feats.unsqueeze(1),
+            stomata_feats.unsqueeze(0),
+            dim=-1
+        )
+        noise_sim = F.cosine_similarity(
+            noise_feats.unsqueeze(1),
+            noise_feats.unsqueeze(0),
+            dim=-1
+        )
+
+        # 排除對角線後計算平均
+        n_s = len(stomata_positions)
+        n_n = len(noise_positions)
+        stomata_consistency = (stomata_sim.sum() - n_s) / (n_s * (n_s - 1))
+        noise_consistency = (noise_sim.sum() - n_n) / (n_n * (n_n - 1))
+
+        print(f"Stomata group consistency: {stomata_consistency:.4f}")
+        print(f"Noise group consistency: {noise_consistency:.4f}")
+        print(f"Ratio: {stomata_consistency / noise_consistency:.2f}x")
+
+        if stomata_consistency > noise_consistency:
+            print("✓ 假設成立：L_intra 預期有效")
+        else:
+            print("✗ 假設不成立：需要重新評估設計")
+
+        return stomata_consistency, noise_consistency
+```
+
+#### L_inter: Inter-Region Contrast Loss（核心）
+
+**目的**：峰值區域和谷值區域的特徵應該不同
+
+**直覺**：如果峰值是 stomata，谷值是背景，它們的特徵應該有區別
+
+**計算方式**：
+
+```python
+# 1. 計算峰值區域的平均特徵
+peak_features = (features * grid.unsqueeze(-1)).sum(dim=[1,2]) / grid.sum(dim=[1,2], keepdim=True)
+
+# 2. 計算谷值區域的平均特徵
+valley_mask = 1 - grid
+valley_features = (features * valley_mask.unsqueeze(-1)).sum(dim=[1,2]) / valley_mask.sum(dim=[1,2], keepdim=True)
+
+# 3. 最小化兩者的相似度（= 最大化區分度）
+L_inter = cosine_similarity(peak_features, valley_features).mean()
+```
+
+$$
+\mathcal{L}_{\text{inter}} = \cos\left( \frac{\sum G \cdot \mathbf{x}}{\sum G}, \frac{\sum (1-G) \cdot \mathbf{x}}{\sum (1-G)} \right)
+$$
+
+**與原 L_contrast 的差異**：概念相同，但強調這是**核心 loss**，不依賴 DINO 的檢測能力
+
+#### L_period: Periodicity Loss
+
+**目的**：確保 Grid 本身保持週期性結構
+
+**計算方式**：
+
+```python
+# 1. 對 Grid 每行做 FFT
+grid_fft = torch.fft.rfft(grid, dim=-1)
+grid_power = torch.abs(grid_fft) ** 2
+
+# 2. 找出 Grid 的主頻率
+grid_dominant_freq = grid_power[:, :, 1:].argmax(dim=-1) + 1
+
+# 3. 與估計的頻率比較
+L_period = F.l1_loss(grid_dominant_freq.float(), estimated_freq)
+```
+
+$$
+\mathcal{L}_{\text{period}} = \frac{1}{BH} \sum_{b,h} |f_h^{\text{grid}} - f_h^{\text{estimated}}|
+$$
+
+**目的**：防止 Grid 退化為任意 pattern
+
+#### L_freq_smooth: Frequency Smoothness Loss
+
+**目的**：相鄰行的頻率應該相似（空間連續性）
+
+$$
+\mathcal{L}_{\text{freq\_smooth}} = \frac{1}{B(H-1)} \sum_{b,h} |f_h - f_{h+1}|
+$$
+
+**直覺**：植物組織的結構是連續的，相鄰行不會有劇烈的頻率變化
+
+#### L_sparse: Sparsity Loss
+
+**目的**：Grid 應該是稀疏的（大部分區域為暗）
+
+$$
+\mathcal{L}_{\text{sparse}} = \text{mean}(G)
+$$
+
+**直覺**：Stomata 只佔圖像的一小部分，Grid 不應該全亮
+
+**變體**（更強的稀疏約束）：
+
+$$
+\mathcal{L}_{\text{sparse}} = \max(0, \text{mean}(G) - \tau)
+$$
+
+其中 $\tau$ 是目標稀疏度（如 0.1 = 10% 覆蓋率）
+
+### 6.4 為什麼這些 Loss 有效？
+
+**關鍵洞察**：即使 DINO 無法直接檢測 stomata，但：
+
+1. **Stomata 的特徵是一致的**：同一張圖的 stomata 長得很像
+2. **Stomata 與背景不同**：雖然 noise 可能和 stomata 相似，但平均來看背景還是不同的
+3. **Stomata 是週期性的**：這是最強的先驗
+
+**工作機制**：
+
+```
+初始狀態：
+  - Grid 是根據 FFT 頻率生成的週期性 pattern
+  - 這個 pattern 可能對也可能不對
+
+訓練過程：
+  - L_intra 推動：被選中的位置特徵要一致
+    → 如果選錯了（選到 noise），特徵不一致，loss 高
+    → 如果選對了（選到 stomata），特徵一致，loss 低
+
+  - L_inter 推動：峰值和谷值特徵要不同
+    → 防止 Grid 退化為全亮或全暗
+
+  - L_period 推動：Grid 必須保持週期性
+    → 防止 Grid 任意變形去「作弊」
+
+收斂結果：
+  - Grid 會收斂到能最大化特徵一致性的週期性 pattern
+  - 這個 pattern 就對應到 stomata 的位置
+```
+
+### 6.5 總損失
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{intra}} + \mathcal{L}_{\text{inter}} + 0.5 \mathcal{L}_{\text{period}} + 0.5 \mathcal{L}_{\text{freq\_smooth}} + 0.1 \mathcal{L}_{\text{sparse}}
+$$
+
+### 6.6 Loss 權重調整建議
+
+| 情況 | 調整 |
+|-----|------|
+| Grid 全亮 | 增加 L_sparse 權重 |
+| Grid 不像週期性 | 增加 L_period 權重 |
+| 特徵區分度低 | 增加 L_inter 權重 |
+| 頻率跳動太大 | 增加 L_freq_smooth 權重 |
+
+### 6.7 與原設計的差異總結
+
+| 項目 | 原設計 | 修正後 |
+|-----|-------|--------|
+| 依賴 DINO 檢測能力 | 是（L_align） | **否** |
+| 核心監督信號 | Feature Similarity Map | **特徵一致性 + 週期性先驗** |
+| L_align | CLS-patch 相似度 | **移除**（DINO 無法檢測） |
+| L_contrast | 輔助 loss | **升級為核心 L_inter** |
+| 新增 | - | **L_intra**（最重要） |
+
+---
+
+## 7. 訓練配置
+
+### 7.1 模型設定
+
+| 項目 | 值 | 說明 |
+|-----|---|------|
+| Backbone | ViT-Base | DINOv3 預訓練 |
+| patch_size | 16 | |
+| embed_dim | 768 | |
+| SEGM 插入點 | Block 10 之後 | 讓 Block 11, 12 受益 |
+
+### 7.2 訓練參數
+
+| 參數 | 建議值 | 說明 |
+|-----|-------|------|
+| learning_rate | 1e-4 | 只訓練 SEGM |
+| optimizer | AdamW | |
+| weight_decay | 0.01 | |
+| batch_size | 16-32 | 根據 GPU |
+| warmup_epochs | 5 | 讓 gate 慢慢打開 |
+| num_epochs | 50-100 | 自監督需要較多 epochs |
+
+### 7.3 凍結策略
+
+```python
+# 凍結 DINO backbone
+for name, param in model.named_parameters():
+    if 'segm' not in name:
+        param.requires_grad = False
+```
+
+### 7.4 權重載入
+
+```python
+# 載入 DINO 預訓練權重，忽略 SEGM 參數
+checkpoint = torch.load('dinov3_vitb16.pth')
+model.load_state_dict(checkpoint, strict=False)
+```
+
+---
+
+## 8. 實作檢查清單
+
+### 8.1 程式碼結構驗證
+
+- [ ] 確認 `dinov3-main` 在 Python path 中
+- [ ] 確認可以 import `DinoVisionTransformer`
+- [ ] 確認 `n_storage_tokens` 屬性存在
+
+### 8.2 Tensor Shape 驗證
+
+| 檢查點 | 預期 Shape |
+|-------|-----------|
+| 原始 x_list | `List[Tensor(B, N, C)]` |
+| rope | `List[(H, W)]` |
+| 分離後 patch_tokens | `(B, H×W, C)` |
+| Reshape 後 | `(B, H, W, C)` |
+| FFT 後 | `(B, H, hidden_dim, W//2+1)` [complex] |
+| dominant_freq | `(B, H)` |
+| Grid | `(B, 1, H, W)` |
+| enhanced_tokens | `(B, H×W, C)` |
+
+### 8.3 初始化驗證
+
+- [ ] `gate` 初始化為 0
+- [ ] `row_phase` 隨機初始化
+- [ ] `kappa` 初始化讓波形較平緩
+
+### 8.4 功能驗證
+
+- [ ] 第一個 epoch，輸出應接近原始 DINO（因 gate=0）
+- [ ] Grid 視覺化顯示週期性結構
+- [ ] 頻率估計值在合理範圍
+
+### 8.5 梯度流驗證
+
+```python
+# 確認梯度只流向 SEGM 參數
+loss.backward()
+for name, param in model.named_parameters():
+    if param.grad is not None:
+        assert 'segm' in name, f"梯度洩漏到: {name}"
+```
+
+---
+
+## 附錄 A：DINOv3 關鍵程式碼參考
+
+### A.1 forward_features_list (需要覆寫)
+
+**位置**：`vision_transformer.py:222-261`
+
+```python
+def forward_features_list(self, x_list, masks_list):
+    x = []
+    rope = []
+    for t_x, t_masks in zip(x_list, masks_list):
+        t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
+        x.append(t2_x)
+        rope.append(hw_tuple)
+
+    # ★ 這裡是關鍵修改點 ★
+    for _, blk in enumerate(self.blocks):
+        if self.rope_embed is not None:
+            rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+        else:
+            rope_sincos = [None for r in rope]
+        x = blk(x, rope_sincos)
+
+    # 後續 norm 和輸出處理...
+```
+
+### A.2 Token 結構
+
+```
+每個 tensor 的結構（N = 1 + n_storage + H×W）：
+
+┌─────────────────────────────────────────────────────────┐
+│ CLS │ storage_0 │ ... │ storage_n │ patch_0 │ ... │ patch_HW │
+│  1  │←────── n_storage ────────→│←────── H×W ─────────→│
+└─────────────────────────────────────────────────────────┘
+
+分離方式：
+prefix_len = 1 + self.n_storage_tokens
+prefix_tokens = x[:, :prefix_len, :]
+patch_tokens = x[:, prefix_len:, :]
+```
+
+### A.3 Block 輸入輸出
+
+**位置**：`block.py:200-212`
+
+```python
+def forward(self, x_or_x_list, rope_or_rope_list=None):
+    if isinstance(x_or_x_list, Tensor):
+        return self._forward_list([x_or_x_list], [rope_or_rope_list])[0]
+    elif isinstance(x_or_x_list, list):
+        return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list)
+```
+
+---
+
+## 附錄 B：與原 SPEC 的差異
+
+### B.1 DINOv3 整合相關
+
+| 設計點 | 原 SPEC | 修正後 |
+|-------|---------|--------|
+| Tensor 格式 | `(B, C, H, W)` | **`List[(B, N, C)]`** |
+| 空間維度來源 | 從 tensor shape 推斷 | **從 rope tuple 取得** |
+| Block 迴圈 | 假設有 index | **需要自己加 enumerate** |
+| 頻率預測 | MLP | **FFT per-row** |
+| 整合方式 | Hook | **繼承 + 覆寫** |
+
+### B.2 監督信號與損失函數
+
+| 設計點 | 原 SPEC | 修正後 |
+|-------|---------|--------|
+| DINO 檢測能力假設 | 部分可用 | **幾乎無法檢測 stomata** |
+| 監督信號 | CLS-patch similarity | **純粹依賴週期性先驗** |
+| L_align | 核心 loss | **移除**（無效） |
+| L_contrast | 輔助 loss (0.3) | **升級為 L_inter (1.0)** |
+| 新增 L_intra | - | **核心 loss，峰值特徵一致性** |
+| L_freq | 頻率連續性 | **改名為 L_freq_smooth** |
+
+### B.3 週期性處理
+
+| 設計點 | 原 SPEC | 修正後 |
+|-------|---------|--------|
+| 週期假設 | 完美週期 | **不完美，需要容忍** |
+| κ (kappa) | 未明確 | **建議 1~2（寬峰）** |
+| Modulation 方式 | Hard: `input + gate × delta` | **Soft: 加權調變** |
+| 週期性策略 | 單一 | **四種方案 A/B/C/D** |
+
+---
+
+## 附錄 C：程式碼驗證來源
+
+> 以下所有發現均經由實際讀取程式碼驗證，附上確切檔案路徑和行號。
+
+### C.1 Tensor 格式驗證
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| x 是 List | `vision_transformer.py` | 222-228 | `x = []; for t_x, t_masks in zip(x_list, masks_list): x.append(t2_x)` |
+| rope 存 (H, W) | `vision_transformer.py` | 227-228 | `rope.append(hw_tuple)` |
+| Block 接受 List | `block.py` | 200-212 | `if isinstance(x_or_x_list, list): return self._forward_list(...)` |
+
+### C.2 Token 結構驗證
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| CLS token | `vision_transformer.py` | 112 | `self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim))` |
+| Storage tokens | `vision_transformer.py` | 113-115 | `self.n_storage_tokens = n_storage_tokens` |
+| Token 順序 | `vision_transformer.py` | 211-218 | `torch.cat([cls_token.expand(...), storage_tokens.expand(...), x], dim=1)` |
+
+### C.3 準備 Tokens 流程
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| patch_embed 輸出 | `vision_transformer.py` | 191-192 | `x = self.patch_embed(x); B, H, W, _ = x.shape` |
+| Flatten | `vision_transformer.py` | 193 | `x = x.flatten(1, 2)` |
+| 回傳 H, W | `vision_transformer.py` | 220 | `return x, (H, W)` |
+
+### C.4 Block 迴圈驗證
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| Index 被丟棄 | `vision_transformer.py` | 229 | `for _, blk in enumerate(self.blocks):` |
+| RoPE 處理 | `vision_transformer.py` | 230-233 | `rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]` |
+| Block forward | `vision_transformer.py` | 234 | `x = blk(x, rope_sincos)` |
+
+### C.5 Attention 機制驗證
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| Flash Attention | `attention.py` | 116 | `x = torch.nn.functional.scaled_dot_product_attention(q, k, v)` |
+| 無法取 weights | - | - | `scaled_dot_product_attention` 不回傳 attention weights |
+
+### C.6 輸出格式驗證
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| x_norm_clstoken | `vision_transformer.py` | 254 | `"x_norm_clstoken": x_norm_cls_reg[:, 0]` |
+| x_norm_patchtokens | `vision_transformer.py` | 256 | `"x_norm_patchtokens": x_norm_patch` |
+| 分離 prefix/patch | `vision_transformer.py` | 247, 250-251 | `x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])` |
+
+### C.7 現有 Adapter 參考
+
+| 發現 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| 組合設計 | `dinov3_adapter.py` | 324 | `self.backbone = backbone` |
+| 凍結 backbone | `dinov3_adapter.py` | 326 | `self.backbone.requires_grad_(False)` |
+| 使用 get_intermediate_layers | `dinov3_adapter.py` | 424-426 | `all_layers = self.backbone.get_intermediate_layers(...)` |
+
+### C.8 關鍵屬性驗證
+
+| 屬性 | 檔案 | 行號 | 程式碼片段 |
+|-----|------|-----|-----------|
+| embed_dim | `vision_transformer.py` | 99 | `self.num_features = self.embed_dim = embed_dim` |
+| n_blocks | `vision_transformer.py` | 100 | `self.n_blocks = depth` |
+| patch_size | `vision_transformer.py` | 102 | `self.patch_size = patch_size` |
+| n_storage_tokens | `vision_transformer.py` | 113 | `self.n_storage_tokens = n_storage_tokens` |
+| blocks | `vision_transformer.py` | 160 | `self.blocks = nn.ModuleList(blocks_list)` |
+
+---
+
+## 附錄 D：實作注意事項
+
+### D.1 Import 路徑設定
+
+由於 DINOv3 不是標準 pip 套件，需要手動設定 path：
+
+```python
+import sys
+sys.path.insert(0, '/path/to/dinov3-main')
+
+from dinov3.models.vision_transformer import DinoVisionTransformer
+```
+
+### D.2 覆寫 forward_features_list 的完整性
+
+覆寫時需要**完整複製** `forward_features_list` 的後半部分（norm 和輸出處理），因為：
+
+1. 無法只覆寫 Block 迴圈部分
+2. 需要保持輸出 dict 格式一致
+
+建議複製範圍：`vision_transformer.py:222-261`（約 40 行）
+
+### D.3 Multi-crop 支援
+
+DINOv3 的 `forward_features_list` 設計是為了支援 multi-crop 訓練：
+- `x_list` 可能包含多個不同解析度的 crop
+- 每個 crop 有不同的 `(H, W)`
+
+SEGM 設計已考慮這點，每個 crop 獨立處理。
+
+### D.4 Gradient Checkpointing
+
+若需要節省記憶體，可以對 SEGM 模組使用 gradient checkpointing：
+
+```python
+from torch.utils.checkpoint import checkpoint
+
+# 在 _apply_segm 中
+enhanced_patches = checkpoint(segm_module, patch_tokens, H, W)
+```
+
+---
+
+## 附錄 E：總結與推薦配置
+
+### E.1 核心設計理念
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SEGM v2 設計理念                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  問題：DINO 無法直接檢測 stomata（noise 外觀相似）               │
+│                                                                  │
+│  解法：利用 stomata 的唯一可靠特徵 —— 週期性排列                 │
+│                                                                  │
+│  原理：                                                          │
+│    • Stomata 是週期性的 → 可用 FFT 估計頻率                     │
+│    • Noise 是隨機的 → 不符合週期性 pattern                       │
+│    • 用週期性 Grid 引導 DINO 關注正確位置                        │
+│                                                                  │
+│  ⭐ 群體一致性原理（L_intra 的理論基礎）：                       │
+│    • 單個比較: stomata_feat ≈ noise_feat（難區分）              │
+│    • 群體比較:                                                   │
+│      - {stomata_1, stomata_2, ...} → 同類物體 → 高一致性        │
+│      - {反光, 葉脈, 細胞壁, ...}  → 不同物體 → 低一致性         │
+│    • Grid 對到 stomata → 峰值特徵一致 → L_intra 低 → 維持       │
+│    • Grid 對到 noise → 峰值特徵不一致 → L_intra 高 → 調整       │
+│                                                                  │
+│  自監督：                                                        │
+│    • L_intra：被選位置的特徵應一致（群體一致性）                 │
+│    • L_inter：峰/谷特徵應不同（前景/背景區分）                   │
+│    • L_period + L_sparse：確保 Grid 合理                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### E.1.1 與 MTKD 框架的整合
+
+FilterBank-enhanced DINO 可以作為 MTKD 框架中的 Feature Teacher：
+
+```
+MTKD + FilterBank 整合架構：
+
+┌────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  DINO + FilterBank (Feature Teacher)                           │
+│  ├── 提供：Enhanced Features（週期性區域被強化）                │
+│  └── 角色：引導 Student 關注週期性位置                          │
+│                                                                 │
+│  YOLOv8 (Detection Teacher)                                    │
+│  ├── 提供：Predictions（含 stomata + false positives）          │
+│  └── 角色：提供檢測知識                                         │
+│                                                                 │
+│  YOLOv11 (Student)                                             │
+│  ├── 學習：同時對齊 Enhanced Features 和 YOLOv8 Predictions     │
+│  └── 效果：偏好週期性位置 → 減少 False Positives                │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+
+訓練效果：
+1. YOLOv8 預測的 FP（noise）位置 → Enhanced Features 響應低
+2. YOLOv8 預測的 TP（stomata）位置 → Enhanced Features 響應高
+3. YOLOv11 對齊 Enhanced Features → 學會區分 TP/FP
+4. 結果：YOLOv11 的 FP 減少
+```
+
+### E.2 處理不完美週期性的四種策略
+
+| 方案 | 策略 | 核心思路 | 推薦度 |
+|-----|------|---------|--------|
+| **A** | 寬鬆峰值 | 低 κ 值，容忍位置偏差 | ★★★★★ |
+| **B** | 頻率帶通 | 頻域操作，不依賴 phase | ★★★ |
+| **C** | 統計先驗 | 只在週期性明顯時調變 | ★★★★★ |
+| **D** | 特徵引導 | 用特徵相似度細化位置 | ★★ |
+
+**推薦組合**：**A + C + Soft Modulation**
+
+### E.3 推薦配置總表
+
+```yaml
+# segm_v2_config.yaml
+
+model:
+  backbone: "dinov3_vitb16"
+  segm_after_blocks: [10]
+
+segm:
+  # 頻率估計
+  num_freq_bins: 32
+  hidden_dim: 256
+
+  # Grid 生成
+  kappa_init: 1.0            # 寬峰 (方案 A)
+  use_soft_modulation: true  # Soft Modulation
+  soft_temperature: 5.0
+
+  # 統計先驗 (方案 C)
+  use_periodicity_gate: true
+  periodicity_threshold: 2.0
+
+loss:
+  # 核心 loss
+  intra_weight: 1.0          # 峰值特徵一致性
+  inter_weight: 1.0          # 峰/谷區分度
+
+  # 正則化
+  period_weight: 0.5         # 週期性約束
+  freq_smooth_weight: 0.5    # 頻率平滑
+  sparse_weight: 0.1         # 稀疏性
+  sparse_target: 0.1         # 目標覆蓋率 10%
+
+training:
+  learning_rate: 1e-4
+  optimizer: "AdamW"
+  weight_decay: 0.01
+  batch_size: 16
+  warmup_epochs: 5
+  num_epochs: 100
+
+  # 凍結策略
+  freeze_backbone: true
+```
+
+### E.4 預期行為
+
+| 訓練階段 | 預期現象 |
+|---------|---------|
+| Epoch 0 | Grid 是 FFT 估計的週期 pattern；gate ≈ 0，輸出 ≈ 原始 DINO |
+| Epoch 1-10 | Gate 逐漸打開；Grid 開始微調以最大化 L_intra |
+| Epoch 10-50 | Grid 收斂到穩定 pattern；頻率估計變準確 |
+| 收斂後 | Grid 峰值對應 stomata 位置；特徵被週期性引導增強 |
+
+### E.5 驗證檢查點
+
+1. **Grid 視覺化**：應顯示明顯的週期性結構
+2. **頻率估計**：每行的主頻率應在合理範圍（如 2-8 cycles/row）
+3. **L_intra 下降**：表示峰值位置的特徵越來越一致
+4. **L_inter 下降**：表示峰/谷區分度越來越大
+5. **與原始 DINO 比較**：增強後的特徵應更聚焦在週期性位置
+
+### E.6 潛在風險與緩解
+
+| 風險 | 徵兆 | 緩解措施 |
+|-----|------|---------|
+| Grid 全亮/全暗 | L_sparse 很大或很小 | 調整 sparse_weight 和 sparse_target |
+| 頻率估計失效 | Grid 不像週期性 | 增加 period_weight；檢查 FFT 實作 |
+| Gate 無法打開 | 輸出始終 ≈ 原始 DINO | 增加 learning_rate；檢查梯度流 |
+| 過擬合單一頻率 | 所有行頻率相同 | 增加 freq_smooth_weight；加頻率多樣性正則化 |
+| L_intra 不下降 | 群體一致性假設不成立 | 執行 E.7 驗證實驗；考慮替代方案 |
+
+### E.7 ⭐ 訓練前驗證實驗（強烈建議）
+
+在投入訓練資源前，先驗證 L_intra 的核心假設是否成立：
+
+> **🔧 獨立驗證腳本**
+>
+> 我們提供了兩個可直接執行的驗證腳本：
+>
+> #### 驗證 1：群體一致性（L_intra 基礎假設）
+> ```bash
+> # 位置：dinov3-main/verify_group_consistency.py
+> python verify_group_consistency.py
+> ```
+> - **測試內容**：Stomata 特徵彼此相似 vs Noise 特徵彼此不同
+> - **輸入**：5-10 個 stomata 座標 + 5-10 個 noise 座標
+> - **預期結果**：stomata_consistency > noise_consistency
+>
+> #### 驗證 2：行週期性（FilterBank 核心機制）⭐
+> ```bash
+> # 位置：dinov3-main/verify_row_periodicity.py
+> python verify_row_periodicity.py
+> ```
+> - **測試內容**：有 stomata 的行有週期性 vs 沒有 stomata 的行無週期性
+> - **輸入**：3-5 個有 stomata 的行 Y 座標 + 3-5 個無 stomata 的行 Y 座標
+> - **預期結果**：stomata_row_periodicity > non_stomata_row_periodicity
+> - **這是 FilterBank 過濾 noise 的核心機制**：即使 noise 長得像 stomata，但它不在週期位置上，就會被壓低
+>
+> **建議**：兩個驗證都執行，確保假設成立後再進行訓練。
+
+**以下為驗證邏輯的詳細說明**：
+
+```python
+"""
+驗證實驗：確認 stomata 群體一致性 > noise 群體一致性
+
+執行方式：
+1. 準備一張帶有 Ground Truth 標注的圖像
+2. 人工標記 5-10 個 stomata 位置
+3. 人工標記 5-10 個 noise 位置（反光、葉脈、細胞壁等）
+4. 執行此腳本
+"""
+
+import torch
+import torch.nn.functional as F
+
+def verify_group_consistency_assumption(
+    dino_model,
+    image,                    # (1, 3, 224, 224)
+    stomata_pixel_positions,  # [(x1, y1), (x2, y2), ...] 像素座標
+    noise_pixel_positions,    # [(x1, y1), (x2, y2), ...]
+    patch_size=16,
+):
+    """
+    Returns:
+        is_valid: bool - 假設是否成立
+        stomata_consistency: float
+        noise_consistency: float
+    """
+    dino_model.eval()
+
+    with torch.no_grad():
+        # 提取 DINO 特徵
+        output = dino_model(image)
+        features = output['x_norm_patchtokens']  # (1, 196, 768)
+        features = features.view(1, 14, 14, 768)  # (1, H, W, C)
+
+        # 轉換像素座標到 patch 座標
+        def pixel_to_patch(positions):
+            return [(x // patch_size, y // patch_size) for (x, y) in positions]
+
+        stomata_patches = pixel_to_patch(stomata_pixel_positions)
+        noise_patches = pixel_to_patch(noise_pixel_positions)
+
+        # 提取特徵
+        stomata_feats = torch.stack([
+            features[0, py, px, :] for (px, py) in stomata_patches
+        ])  # (N_stomata, 768)
+
+        noise_feats = torch.stack([
+            features[0, py, px, :] for (px, py) in noise_patches
+        ])  # (N_noise, 768)
+
+        # 計算 pairwise cosine similarity
+        def pairwise_cosine(feats):
+            feats_norm = F.normalize(feats, dim=-1)
+            sim_matrix = feats_norm @ feats_norm.T  # (N, N)
+            # 排除對角線
+            n = feats.shape[0]
+            mask = ~torch.eye(n, dtype=bool, device=feats.device)
+            return sim_matrix[mask].mean()
+
+        stomata_consistency = pairwise_cosine(stomata_feats).item()
+        noise_consistency = pairwise_cosine(noise_feats).item()
+
+        # 結果分析
+        print("=" * 60)
+        print("群體一致性驗證結果")
+        print("=" * 60)
+        print(f"Stomata 群體一致性: {stomata_consistency:.4f}")
+        print(f"Noise 群體一致性:   {noise_consistency:.4f}")
+        print(f"比值 (stomata/noise): {stomata_consistency/noise_consistency:.2f}x")
+        print("-" * 60)
+
+        is_valid = stomata_consistency > noise_consistency
+
+        if is_valid:
+            print("✅ 假設成立：L_intra 預期有效")
+            print("   → 可以進行 FilterBank 訓練")
+        else:
+            print("❌ 假設不成立：L_intra 可能無效")
+            print("   → 建議檢查：")
+            print("     1. 標記的位置是否正確？")
+            print("     2. Noise 類別是否太單一？（應包含多種）")
+            print("     3. 考慮替代方案（見 E.8）")
+
+        print("=" * 60)
+
+        return is_valid, stomata_consistency, noise_consistency
+
+
+# 使用範例
+if __name__ == "__main__":
+    from dinov3.models import build_model
+
+    # 載入 DINO
+    dino = build_model(model_name="vit_base", patch_size=16)
+    dino.load_state_dict(torch.load("dinov3_vitb16.pth"))
+
+    # 載入測試圖像
+    image = load_image("test_stomata.jpg")  # 需自行實作
+
+    # 人工標記的位置（像素座標）
+    stomata_positions = [
+        (45, 30), (120, 32), (195, 28),  # Row 0 的幾個 stomata
+        (60, 95), (135, 98), (210, 92),  # Row 2 的幾個 stomata
+    ]
+
+    noise_positions = [
+        (80, 60),   # 反光
+        (150, 120), # 葉脈交叉
+        (30, 150),  # 細胞壁
+        (200, 45),  # 模糊區域
+        (100, 180), # 另一個反光
+    ]
+
+    is_valid, s_cons, n_cons = verify_group_consistency_assumption(
+        dino, image, stomata_positions, noise_positions
+    )
+```
+
+### E.8 假設不成立時的替代方案
+
+如果 E.7 驗證實驗顯示 `stomata_consistency ≤ noise_consistency`：
+
+| 替代方案 | 說明 | 複雜度 |
+|---------|------|--------|
+| **方案 1：增加 noise 多樣性** | 確保 noise 包含多種類型（反光、葉脈、細胞壁、模糊等） | 低 |
+| **方案 2：使用 YOLO 預測引導** | 用 YOLOv8 預測位置來估計週期性，而非 DINO 特徵 | 中 |
+| **方案 3：多尺度特徵** | 結合 DINO 早期層（更細粒度）和晚期層特徵 | 中 |
+| **方案 4：改用 Autocorrelation** | 用特徵自相關替代 FFT 估計週期 | 中 |
+| **方案 5：放棄 DINO Feature** | 直接在 YOLO 預測上做週期性後處理 | 低 |
+
+---
+
+## 附錄 F：完整實作程式碼
+
+> 以下為可直接使用的完整實作程式碼
+
+### F.1 檔案結構
+
+```
+segm_v2/
+├── __init__.py
+├── models/
+│   ├── __init__.py
+│   ├── frequency_estimator.py      # F.2
+│   ├── grid_generator.py           # F.3
+│   ├── segm_adapter.py             # F.4
+│   └── segm_vision_transformer.py  # F.5
+├── losses/
+│   ├── __init__.py
+│   └── unsupervised_loss.py        # F.6
+└── train.py                        # F.7
+```
+
+### F.2 frequency_estimator.py
+
+```python
+# segm_v2/models/frequency_estimator.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+
+class RowFrequencyEstimator(nn.Module):
+    """
+    對每一行進行頻率分析，估計水平方向的週期性
+
+    輸入: (B, H, W, C) - 空間格式特徵
+    輸出: dict containing:
+        - dominant_freq: (B, H) - 每行主頻率，範圍 [0, 1]
+        - freq_spectrum: (B, H, num_freq_bins) - 完整頻譜
+        - periodicity_score: (B, H) - 週期性強度
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        hidden_dim: int = 256,
+        num_freq_bins: int = 32,
+        use_learnable_filter: bool = True,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_freq_bins = num_freq_bins
+
+        # 1. Feature projection: C → hidden_dim
+        self.feature_proj = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 2. Learnable frequency filter (可選)
+        self.use_learnable_filter = use_learnable_filter
+        if use_learnable_filter:
+            self.freq_filter = nn.Parameter(torch.ones(num_freq_bins))
+
+        # 3. Frequency encoding: num_freq_bins → embed_dim
+        self.freq_encoder = nn.Sequential(
+            nn.Linear(num_freq_bins, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, spatial_features: Tensor) -> dict:
+        """
+        Args:
+            spatial_features: (B, H, W, C)
+
+        Returns:
+            dict with keys:
+                - dominant_freq: (B, H)
+                - freq_spectrum: (B, H, num_freq_bins)
+                - periodicity_score: (B, H)
+                - row_freq_features: (B, H, C)
+        """
+        B, H, W, C = spatial_features.shape
+
+        # 1. Feature projection
+        # (B, H, W, C) → (B, H, W, hidden_dim)
+        projected = self.feature_proj(spatial_features)
+
+        # 2. Row-wise 1D rFFT
+        # 對每行沿 W 方向做 FFT
+        # (B, H, W, hidden_dim) → (B, H, hidden_dim, W//2+1) [complex]
+        projected_transposed = projected.permute(0, 1, 3, 2)  # (B, H, hidden_dim, W)
+        fft_result = torch.fft.rfft(projected_transposed, dim=-1)  # (B, H, hidden_dim, W//2+1)
+
+        # 3. Power spectrum
+        # magnitude² → mean over hidden_dim → (B, H, W//2+1)
+        power_spectrum = torch.abs(fft_result) ** 2
+        power_spectrum = power_spectrum.mean(dim=2)  # (B, H, W//2+1)
+
+        # 4. Interpolate to fixed number of bins
+        # (B, H, W//2+1) → (B, H, num_freq_bins)
+        power_spectrum_resized = F.interpolate(
+            power_spectrum.unsqueeze(1),  # (B, 1, H, W//2+1)
+            size=(H, self.num_freq_bins),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(1)  # (B, H, num_freq_bins)
+
+        # 5. Apply learnable filter (可選)
+        if self.use_learnable_filter:
+            freq_spectrum = power_spectrum_resized * F.softplus(self.freq_filter)
+        else:
+            freq_spectrum = power_spectrum_resized
+
+        # 6. Find dominant frequency (排除 DC component)
+        # DC 在 index 0，所以從 index 1 開始找
+        freq_spectrum_no_dc = freq_spectrum[:, :, 1:]  # (B, H, num_freq_bins-1)
+        dominant_freq_idx = freq_spectrum_no_dc.argmax(dim=-1) + 1  # (B, H)
+
+        # 正規化到 [0, 1]
+        dominant_freq = dominant_freq_idx.float() / self.num_freq_bins
+
+        # 7. Calculate periodicity score (peak / mean ratio)
+        peak_power = freq_spectrum_no_dc.max(dim=-1).values  # (B, H)
+        mean_power = freq_spectrum_no_dc.mean(dim=-1)  # (B, H)
+        periodicity_score = peak_power / (mean_power + 1e-6)  # (B, H)
+
+        # 8. Frequency encoding
+        # (B, H, num_freq_bins) → (B, H, C)
+        row_freq_features = self.freq_encoder(freq_spectrum)
+
+        return {
+            'dominant_freq': dominant_freq,           # (B, H)
+            'freq_spectrum': freq_spectrum,           # (B, H, num_freq_bins)
+            'periodicity_score': periodicity_score,   # (B, H)
+            'row_freq_features': row_freq_features,   # (B, H, C)
+        }
+```
+
+### F.3 grid_generator.py
+
+```python
+# segm_v2/models/grid_generator.py
+
+import math
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+
+class PeriodicGridGenerator(nn.Module):
+    """
+    根據估計的頻率生成週期性 Grid
+
+    使用 Power Cosine Wave: ((cos(2πft + φ) + 1) / 2)^κ
+
+    輸入:
+        - dominant_freq: (B, H) - 每行的主頻率
+        - H, W: 空間維度
+    輸出:
+        - grid: (B, 1, H, W) - 週期性 Grid，值域 [0, 1]
+    """
+
+    def __init__(
+        self,
+        max_height: int = 64,
+        kappa_init: float = 1.0,
+        use_col_modulation: bool = True,
+        use_soft_modulation: bool = True,
+        soft_temperature: float = 5.0,
+    ):
+        super().__init__()
+
+        self.max_height = max_height
+        self.use_col_modulation = use_col_modulation
+        self.use_soft_modulation = use_soft_modulation
+        self.soft_temperature = soft_temperature
+
+        # 可學習的 per-row 相位
+        self.row_phases = nn.Parameter(torch.zeros(1, max_height))
+
+        # 可學習的 kappa (尖銳度)
+        # 使用 softplus 確保 > 0，初始化使得 softplus(x) ≈ kappa_init
+        kappa_init_value = math.log(math.exp(kappa_init) - 1)  # inverse softplus
+        self.kappa_raw = nn.Parameter(torch.tensor([kappa_init_value]))
+
+        # 列方向調變（可選）
+        if use_col_modulation:
+            self.col_freq = nn.Parameter(torch.zeros(1))
+            self.col_phase = nn.Parameter(torch.zeros(1))
+
+    @property
+    def kappa(self) -> Tensor:
+        """確保 kappa > 0"""
+        return F.softplus(self.kappa_raw) + 0.1  # 最小值 0.1
+
+    def forward(
+        self,
+        dominant_freq: Tensor,
+        periodicity_score: Tensor = None,
+        H: int = None,
+        W: int = None,
+    ) -> Tensor:
+        """
+        Args:
+            dominant_freq: (B, H) - 每行頻率，範圍 [0, 1]
+            periodicity_score: (B, H) - 週期性強度（可選，用於方案 C）
+            H, W: 空間維度
+
+        Returns:
+            grid: (B, 1, H, W)
+        """
+        B = dominant_freq.shape[0]
+        if H is None:
+            H = dominant_freq.shape[1]
+
+        device = dominant_freq.device
+        dtype = dominant_freq.dtype
+
+        # 1. 生成 x 座標 [0, 1, 2, ..., W-1]
+        x_coords = torch.arange(W, device=device, dtype=dtype)  # (W,)
+
+        # 2. 獲取 phase 和 kappa
+        # row_phases: (1, max_height) → (B, H)
+        phases = self.row_phases[:, :H].expand(B, -1)  # (B, H)
+        phases = torch.sigmoid(phases) * 2 * math.pi  # 範圍 [0, 2π]
+
+        kappa = self.kappa  # scalar
+
+        # 3. 計算每行的波形
+        # freq: (B, H) → (B, H, 1)
+        # x: (W,) → (1, 1, W)
+        freq = dominant_freq.unsqueeze(-1)  # (B, H, 1)
+        phase = phases.unsqueeze(-1)         # (B, H, 1)
+        x = x_coords.view(1, 1, W)           # (1, 1, W)
+
+        # 將頻率轉換為週期數（freq 是正規化的，乘以 W 得到實際週期數）
+        # 例如 freq=0.1 表示每 10 個 pixel 一個週期
+        actual_freq = freq * W / 2  # 調整範圍
+
+        # Power Cosine Wave: ((cos(2πf·x/W + φ) + 1) / 2)^κ
+        angle = 2 * math.pi * actual_freq * x / W + phase  # (B, H, W)
+        row_wave = ((torch.cos(angle) + 1) / 2) ** kappa   # (B, H, W)
+
+        # 4. 列方向調變（可選）
+        if self.use_col_modulation:
+            y_coords = torch.arange(H, device=device, dtype=dtype)  # (H,)
+            y = y_coords.view(1, H, 1)  # (1, H, 1)
+
+            col_freq = torch.sigmoid(self.col_freq) * H / 4  # 列方向頻率
+            col_phase = torch.sigmoid(self.col_phase) * 2 * math.pi
+
+            col_angle = 2 * math.pi * col_freq * y / H + col_phase
+            col_wave = ((torch.cos(col_angle) + 1) / 2) ** kappa  # (1, H, 1)
+
+            grid = row_wave * col_wave  # (B, H, W)
+        else:
+            grid = row_wave  # (B, H, W)
+
+        # 5. 方案 C：統計先驗 - 只在週期性明顯時調變
+        if periodicity_score is not None:
+            # periodicity_score: (B, H) → (B, H, 1)
+            score = periodicity_score.unsqueeze(-1)  # (B, H, 1)
+
+            # 使用 sigmoid 做軟閾值
+            periodicity_gate = torch.sigmoid(
+                (score - 2.0) * 2.0  # threshold=2.0, temperature=2.0
+            )  # (B, H, 1)
+
+            grid = grid * periodicity_gate  # 週期性弱的行會被抑制
+
+        # 6. Soft Modulation（方案 A 的一部分）
+        if self.use_soft_modulation:
+            grid = torch.sigmoid((grid - 0.5) * self.soft_temperature)
+
+        # 7. 增加 channel 維度
+        grid = grid.unsqueeze(1)  # (B, 1, H, W)
+
+        return grid
+
+
+# 需要 import F
+import torch.nn.functional as F
+```
+
+### F.4 segm_adapter.py
+
+```python
+# segm_v2/models/segm_adapter.py
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from .frequency_estimator import RowFrequencyEstimator
+from .grid_generator import PeriodicGridGenerator
+
+
+class SEGMAdapter(nn.Module):
+    """
+    在 DINO Block 之間插入的 SEGM 適配器
+
+    輸入輸出都是 (B, N, C) 格式，與 Block 相容
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        num_freq_bins: int = 32,
+        hidden_dim: int = 256,
+        kappa_init: float = 1.0,
+        use_soft_modulation: bool = True,
+        soft_temperature: float = 5.0,
+        use_periodicity_gate: bool = True,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.use_periodicity_gate = use_periodicity_gate
+
+        # 1. Frequency Estimator
+        self.freq_estimator = RowFrequencyEstimator(
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_freq_bins=num_freq_bins,
+        )
+
+        # 2. Grid Generator
+        self.grid_generator = PeriodicGridGenerator(
+            kappa_init=kappa_init,
+            use_soft_modulation=use_soft_modulation,
+            soft_temperature=soft_temperature,
+        )
+
+        # 3. Channel Projection: (B, 1, H, W) → (B, C, H, W)
+        self.channel_proj = nn.Conv2d(1, embed_dim, kernel_size=1, bias=False)
+        nn.init.zeros_(self.channel_proj.weight)  # Zero-init
+
+        # 4. Zero-Init Gate（關鍵！初始化為 0，確保初始輸出 = 原始輸入）
+        self.gate = nn.Parameter(torch.zeros(1))
+
+        # 儲存中間結果用於計算 loss
+        self._freq_info = None
+        self._grid = None
+
+    def forward(self, patch_tokens: Tensor, H: int, W: int) -> Tensor:
+        """
+        Args:
+            patch_tokens: (B, H*W, C) - 只有 patch tokens，不含 CLS
+            H, W: spatial dimensions
+
+        Returns:
+            enhanced_tokens: (B, H*W, C)
+        """
+        B, N, C = patch_tokens.shape
+        assert N == H * W, f"Expected N={H*W}, got N={N}"
+
+        # 1. Reshape to 2D: (B, H*W, C) → (B, H, W, C)
+        spatial = patch_tokens.view(B, H, W, C)
+
+        # 2. Row-wise frequency estimation
+        freq_info = self.freq_estimator(spatial)
+        self._freq_info = freq_info  # 儲存用於 loss 計算
+
+        # 3. Generate periodic grid
+        periodicity_score = freq_info['periodicity_score'] if self.use_periodicity_gate else None
+        grid = self.grid_generator(
+            dominant_freq=freq_info['dominant_freq'],
+            periodicity_score=periodicity_score,
+            H=H,
+            W=W,
+        )  # (B, 1, H, W)
+        self._grid = grid  # 儲存用於 loss 計算
+
+        # 4. Channel projection: (B, 1, H, W) → (B, C, H, W)
+        delta = self.channel_proj(grid)  # (B, C, H, W)
+
+        # 5. 轉換格式: (B, C, H, W) → (B, H, W, C) → (B, H*W, C)
+        delta = delta.permute(0, 2, 3, 1)  # (B, H, W, C)
+        delta = delta.reshape(B, H * W, C)  # (B, N, C)
+
+        # 6. Zero-init gated residual
+        # gate 初始化為 0，所以初始時 enhanced = patch_tokens
+        enhanced = patch_tokens + self.gate * delta
+
+        return enhanced
+
+    def get_freq_info(self) -> dict:
+        """獲取頻率估計資訊（用於 loss 計算）"""
+        return self._freq_info
+
+    def get_grid(self) -> Tensor:
+        """獲取生成的 Grid（用於 loss 計算和視覺化）"""
+        return self._grid
+```
+
+### F.5 segm_vision_transformer.py
+
+```python
+# segm_v2/models/segm_vision_transformer.py
+
+import sys
+from typing import Dict, List, Optional
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+# 添加 DINOv3 路徑
+# 請根據實際路徑調整
+sys.path.insert(0, '/path/to/dinov3-main')
+
+from dinov3.models.vision_transformer import DinoVisionTransformer
+from .segm_adapter import SEGMAdapter
+
+
+class SEGMDinoVisionTransformer(DinoVisionTransformer):
+    """
+    繼承 DINOv3 的 ViT，在指定 Block 後插入 SEGM
+
+    使用方式:
+        model = SEGMDinoVisionTransformer(
+            img_size=224,
+            patch_size=16,
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            segm_after_blocks=[10],
+            segm_config={'num_freq_bins': 32, 'hidden_dim': 256}
+        )
+
+        # 載入 pretrained weights
+        pretrained = torch.load('dinov3_vitb16.pth')
+        model.load_state_dict(pretrained, strict=False)
+    """
+
+    def __init__(
+        self,
+        *args,
+        segm_after_blocks: List[int] = [10],
+        segm_config: Optional[dict] = None,
+        freeze_backbone: bool = True,
+        **kwargs
+    ):
+        # 初始化父類
+        super().__init__(*args, **kwargs)
+
+        # 凍結原始 DINO 參數
+        if freeze_backbone:
+            for param in self.parameters():
+                param.requires_grad = False
+
+        # 建立 SEGM 模組（可訓練）
+        self.segm_after_blocks = set(segm_after_blocks)
+        self.segm_modules = nn.ModuleDict()
+
+        segm_config = segm_config or {}
+        for block_idx in segm_after_blocks:
+            self.segm_modules[str(block_idx)] = SEGMAdapter(
+                embed_dim=self.embed_dim,
+                **segm_config
+            )
+
+    def forward_features_list(
+        self,
+        x_list: List[Tensor],
+        masks_list: List[Optional[Tensor]]
+    ) -> List[Dict[str, Tensor]]:
+        """
+        覆寫 forward_features_list，在指定位置插入 SEGM
+
+        這個方法基本上複製了父類的實作，但在 Block 迴圈中加入 SEGM 插入點
+        """
+        # 1. 準備 tokens
+        x = []
+        rope = []
+        for t_x, t_masks in zip(x_list, masks_list):
+            t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
+            x.append(t2_x)
+            rope.append(hw_tuple)  # rope 存的是 (H, W) tuple
+
+        # 2. 修改的 Block 迴圈（加入 index 追蹤）
+        for blk_idx, blk in enumerate(self.blocks):
+            if self.rope_embed is not None:
+                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+            else:
+                rope_sincos = [None for _ in rope]
+
+            x = blk(x, rope_sincos)
+
+            # ★ 在指定 Block 後插入 SEGM ★
+            if blk_idx in self.segm_after_blocks:
+                segm_module = self.segm_modules[str(blk_idx)]
+                x = self._apply_segm(x, segm_module, rope)
+
+        # 3. Norm 和輸出處理（複製自父類）
+        all_x = x
+        output = []
+        for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
+            if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
+                if self.untie_global_and_local_cls_norm and self.training and idx == 1:
+                    x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
+                elif self.untie_cls_and_patch_norms:
+                    x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
+                else:
+                    x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + 1])
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])
+            else:
+                x_norm = self.norm(x)
+                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
+                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
+
+            output.append({
+                "x_norm_clstoken": x_norm_cls_reg[:, 0],
+                "x_storage_tokens": x_norm_cls_reg[:, 1:],
+                "x_norm_patchtokens": x_norm_patch,
+                "x_prenorm": x,
+                "masks": masks,
+            })
+
+        return output
+
+    def _apply_segm(
+        self,
+        x_list: List[Tensor],
+        segm_module: SEGMAdapter,
+        rope: List[tuple]
+    ) -> List[Tensor]:
+        """
+        對每個 tensor 應用 SEGM
+
+        Args:
+            x_list: List of (B, N, C) tensors
+            segm_module: SEGM adapter module
+            rope: List of (H, W) tuples
+
+        Returns:
+            enhanced_x_list: List of (B, N, C) tensors
+        """
+        enhanced_x = []
+
+        for x, (H, W) in zip(x_list, rope):
+            # x shape: (B, N, C) 其中 N = 1 + n_storage + H*W
+            B, N, C = x.shape
+
+            # 分離 CLS/storage tokens 和 patch tokens
+            prefix_len = 1 + self.n_storage_tokens
+            prefix_tokens = x[:, :prefix_len, :]      # (B, prefix, C)
+            patch_tokens = x[:, prefix_len:, :]       # (B, H*W, C)
+
+            # SEGM 只處理 patch tokens
+            enhanced_patches = segm_module(patch_tokens, H, W)
+
+            # 重新組合
+            enhanced_x.append(
+                torch.cat([prefix_tokens, enhanced_patches], dim=1)
+            )
+
+        return enhanced_x
+
+    def get_segm_outputs(self) -> Dict[str, dict]:
+        """
+        獲取所有 SEGM 模組的輸出（用於 loss 計算）
+
+        Returns:
+            dict mapping block_idx to {'freq_info': ..., 'grid': ...}
+        """
+        outputs = {}
+        for block_idx, module in self.segm_modules.items():
+            outputs[block_idx] = {
+                'freq_info': module.get_freq_info(),
+                'grid': module.get_grid(),
+            }
+        return outputs
+
+
+def create_segm_dino_vitb16(
+    pretrained_path: str = None,
+    segm_after_blocks: List[int] = [10],
+    segm_config: dict = None,
+    **kwargs
+) -> SEGMDinoVisionTransformer:
+    """
+    便捷函數：創建 ViT-Base/16 with SEGM
+
+    Args:
+        pretrained_path: DINOv3 預訓練權重路徑
+        segm_after_blocks: 在哪些 block 後插入 SEGM
+        segm_config: SEGM 配置
+
+    Returns:
+        SEGMDinoVisionTransformer model
+    """
+    model = SEGMDinoVisionTransformer(
+        img_size=kwargs.get('img_size', 224),
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        ffn_ratio=4,
+        segm_after_blocks=segm_after_blocks,
+        segm_config=segm_config or {
+            'num_freq_bins': 32,
+            'hidden_dim': 256,
+            'kappa_init': 1.0,
+            'use_soft_modulation': True,
+            'soft_temperature': 5.0,
+            'use_periodicity_gate': True,
+        },
+        **kwargs
+    )
+
+    if pretrained_path:
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+        missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded pretrained weights from {pretrained_path}")
+        print(f"Missing keys (SEGM params): {len(missing)}")
+        print(f"Unexpected keys: {len(unexpected)}")
+
+    return model
+```
+
+### F.6 unsupervised_loss.py
+
+```python
+# segm_v2/losses/unsupervised_loss.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+
+class SEGMUnsupervisedLoss(nn.Module):
+    """
+    SEGM 的自監督損失函數
+
+    包含:
+        - L_intra: 峰值位置特徵一致性（核心）
+        - L_inter: 峰值 vs 谷值特徵區分度（核心）
+        - L_period: Grid 週期性約束
+        - L_freq_smooth: 頻率平滑約束
+        - L_sparse: 稀疏性約束
+    """
+
+    def __init__(
+        self,
+        intra_weight: float = 1.0,
+        inter_weight: float = 1.0,
+        period_weight: float = 0.5,
+        freq_smooth_weight: float = 0.5,
+        sparse_weight: float = 0.1,
+        sparse_target: float = 0.1,
+        peak_threshold: float = 0.5,
+    ):
+        super().__init__()
+
+        self.intra_weight = intra_weight
+        self.inter_weight = inter_weight
+        self.period_weight = period_weight
+        self.freq_smooth_weight = freq_smooth_weight
+        self.sparse_weight = sparse_weight
+        self.sparse_target = sparse_target
+        self.peak_threshold = peak_threshold
+
+    def forward(
+        self,
+        features: Tensor,
+        grid: Tensor,
+        freq_info: dict,
+    ) -> dict:
+        """
+        計算所有損失項
+
+        Args:
+            features: (B, H, W, C) - 空間格式的特徵
+            grid: (B, 1, H, W) - 生成的 Grid
+            freq_info: dict from RowFrequencyEstimator
+
+        Returns:
+            dict with 'total' and individual loss terms
+        """
+        B, H, W, C = features.shape
+        grid_squeezed = grid.squeeze(1)  # (B, H, W)
+
+        losses = {}
+
+        # 1. L_intra: 峰值位置特徵一致性
+        losses['intra'] = self._compute_intra_loss(features, grid_squeezed)
+
+        # 2. L_inter: 峰值 vs 谷值特徵區分度
+        losses['inter'] = self._compute_inter_loss(features, grid_squeezed)
+
+        # 3. L_period: Grid 週期性約束
+        losses['period'] = self._compute_period_loss(
+            grid_squeezed,
+            freq_info['dominant_freq']
+        )
+
+        # 4. L_freq_smooth: 頻率平滑約束
+        losses['freq_smooth'] = self._compute_freq_smooth_loss(
+            freq_info['dominant_freq']
+        )
+
+        # 5. L_sparse: 稀疏性約束
+        losses['sparse'] = self._compute_sparse_loss(grid_squeezed)
+
+        # 總損失
+        losses['total'] = (
+            self.intra_weight * losses['intra'] +
+            self.inter_weight * losses['inter'] +
+            self.period_weight * losses['period'] +
+            self.freq_smooth_weight * losses['freq_smooth'] +
+            self.sparse_weight * losses['sparse']
+        )
+
+        return losses
+
+    def _compute_intra_loss(self, features: Tensor, grid: Tensor) -> Tensor:
+        """
+        L_intra: Grid 峰值位置的特徵應該彼此相似
+
+        Args:
+            features: (B, H, W, C)
+            grid: (B, H, W)
+
+        Returns:
+            scalar loss
+        """
+        B, H, W, C = features.shape
+
+        # Flatten spatial dimensions
+        features_flat = features.view(B, H * W, C)  # (B, N, C)
+        grid_flat = grid.view(B, H * W)              # (B, N)
+
+        total_loss = 0.0
+        count = 0
+
+        for b in range(B):
+            # 找出峰值位置
+            peak_mask = grid_flat[b] > self.peak_threshold
+            n_peaks = peak_mask.sum().item()
+
+            if n_peaks < 2:
+                continue
+
+            # 提取峰值特徵
+            peak_features = features_flat[b, peak_mask]  # (n_peaks, C)
+
+            # 正規化
+            peak_features_norm = F.normalize(peak_features, dim=-1)
+
+            # 計算相似度矩陣
+            sim_matrix = torch.mm(peak_features_norm, peak_features_norm.t())  # (n_peaks, n_peaks)
+
+            # 排除對角線，計算平均相似度
+            mask = ~torch.eye(n_peaks, dtype=torch.bool, device=sim_matrix.device)
+            avg_sim = sim_matrix[mask].mean()
+
+            # 最大化相似度 = 最小化負相似度
+            total_loss += -avg_sim
+            count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=features.device)
+
+        return total_loss / count
+
+    def _compute_inter_loss(self, features: Tensor, grid: Tensor) -> Tensor:
+        """
+        L_inter: 峰值區域和谷值區域的特徵應該不同
+
+        Args:
+            features: (B, H, W, C)
+            grid: (B, H, W)
+
+        Returns:
+            scalar loss
+        """
+        B, H, W, C = features.shape
+
+        # 使用 grid 作為權重
+        grid_expanded = grid.unsqueeze(-1)  # (B, H, W, 1)
+
+        # 峰值區域的加權平均特徵
+        peak_sum = (features * grid_expanded).sum(dim=[1, 2])  # (B, C)
+        peak_weight = grid.sum(dim=[1, 2], keepdim=True) + 1e-6  # (B, 1)
+        peak_features = peak_sum / peak_weight.squeeze(-1)  # (B, C)
+
+        # 谷值區域的加權平均特徵
+        valley_mask = 1 - grid
+        valley_expanded = valley_mask.unsqueeze(-1)  # (B, H, W, 1)
+        valley_sum = (features * valley_expanded).sum(dim=[1, 2])  # (B, C)
+        valley_weight = valley_mask.sum(dim=[1, 2], keepdim=True) + 1e-6  # (B, 1)
+        valley_features = valley_sum / valley_weight.squeeze(-1)  # (B, C)
+
+        # 計算相似度（最小化 = 最大化區分度）
+        peak_norm = F.normalize(peak_features, dim=-1)
+        valley_norm = F.normalize(valley_features, dim=-1)
+        similarity = (peak_norm * valley_norm).sum(dim=-1).mean()
+
+        return similarity
+
+    def _compute_period_loss(
+        self,
+        grid: Tensor,
+        estimated_freq: Tensor
+    ) -> Tensor:
+        """
+        L_period: Grid 每行的 FFT 主頻率應與估計值一致
+
+        Args:
+            grid: (B, H, W)
+            estimated_freq: (B, H) - 範圍 [0, 1]
+
+        Returns:
+            scalar loss
+        """
+        B, H, W = grid.shape
+
+        # 對 Grid 每行做 FFT
+        grid_fft = torch.fft.rfft(grid, dim=-1)  # (B, H, W//2+1)
+        grid_power = torch.abs(grid_fft) ** 2
+
+        # 找出 Grid 的主頻率（排除 DC）
+        grid_power_no_dc = grid_power[:, :, 1:]  # (B, H, W//2)
+        grid_dominant_idx = grid_power_no_dc.argmax(dim=-1) + 1  # (B, H)
+
+        # 正規化
+        num_freq_bins = grid_power.shape[-1]
+        grid_dominant_freq = grid_dominant_idx.float() / num_freq_bins
+
+        # 與估計的頻率比較
+        loss = F.l1_loss(grid_dominant_freq, estimated_freq)
+
+        return loss
+
+    def _compute_freq_smooth_loss(self, dominant_freq: Tensor) -> Tensor:
+        """
+        L_freq_smooth: 相鄰行的頻率應該相似
+
+        Args:
+            dominant_freq: (B, H)
+
+        Returns:
+            scalar loss
+        """
+        # 計算相鄰行的頻率差
+        freq_diff = torch.abs(dominant_freq[:, 1:] - dominant_freq[:, :-1])  # (B, H-1)
+        loss = freq_diff.mean()
+
+        return loss
+
+    def _compute_sparse_loss(self, grid: Tensor) -> Tensor:
+        """
+        L_sparse: Grid 應該是稀疏的
+
+        Args:
+            grid: (B, H, W)
+
+        Returns:
+            scalar loss
+        """
+        mean_activation = grid.mean()
+
+        # 超過目標稀疏度才懲罰
+        loss = F.relu(mean_activation - self.sparse_target)
+
+        return loss
+```
+
+### F.7 train.py（訓練腳本範例）
+
+```python
+# segm_v2/train.py
+
+import argparse
+import os
+import sys
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from tqdm import tqdm
+
+# 添加路徑
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from segm_v2.models.segm_vision_transformer import create_segm_dino_vitb16
+from segm_v2.losses.unsupervised_loss import SEGMUnsupervisedLoss
+
+
+def get_transform(img_size: int = 224):
+    """獲取資料轉換"""
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+    ])
+
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: SEGMUnsupervisedLoss,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+):
+    """訓練一個 epoch"""
+    model.train()
+    total_losses = {
+        'total': 0.0,
+        'intra': 0.0,
+        'inter': 0.0,
+        'period': 0.0,
+        'freq_smooth': 0.0,
+        'sparse': 0.0,
+    }
+
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    for batch_idx, (images, _) in enumerate(pbar):
+        images = images.to(device)
+        B = images.shape[0]
+
+        # Forward pass
+        outputs = model.forward_features(images)
+
+        # 獲取 SEGM 輸出
+        segm_outputs = model.get_segm_outputs()
+
+        # 對每個 SEGM 模組計算 loss
+        batch_loss = 0.0
+        for block_idx, segm_out in segm_outputs.items():
+            freq_info = segm_out['freq_info']
+            grid = segm_out['grid']
+
+            # 獲取對應的 features
+            # 需要從 outputs 中提取並 reshape
+            patch_tokens = outputs['x_norm_patchtokens']  # (B, N, C)
+            H = W = int(patch_tokens.shape[1] ** 0.5)
+            features = patch_tokens.view(B, H, W, -1)  # (B, H, W, C)
+
+            # 計算 loss
+            losses = criterion(features, grid, freq_info)
+            batch_loss += losses['total']
+
+            # 累積各項 loss 用於記錄
+            for key in total_losses:
+                total_losses[key] += losses[key].item()
+
+        # Backward pass
+        optimizer.zero_grad()
+        batch_loss.backward()
+        optimizer.step()
+
+        # 更新進度條
+        pbar.set_postfix({
+            'loss': f"{batch_loss.item():.4f}",
+            'gate': f"{model.segm_modules['10'].gate.item():.4f}",
+        })
+
+    # 平均 loss
+    n_batches = len(dataloader)
+    for key in total_losses:
+        total_losses[key] /= n_batches
+
+    return total_losses
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--pretrained', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='./checkpoints')
+    parser.add_argument('--img_size', type=int, default=224)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
+    args = parser.parse_args()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # 創建模型
+    model = create_segm_dino_vitb16(
+        pretrained_path=args.pretrained,
+        img_size=args.img_size,
+    ).to(device)
+
+    # 確認只有 SEGM 參數可訓練
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"Trainable parameters: {sum(p.numel() for p in trainable_params)}")
+
+    # 創建資料集
+    transform = get_transform(args.img_size)
+    dataset = ImageFolder(args.data_dir, transform=transform)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    print(f"Dataset size: {len(dataset)}")
+
+    # 創建損失函數和優化器
+    criterion = SEGMUnsupervisedLoss()
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=args.lr,
+        weight_decay=0.01,
+    )
+
+    # 學習率排程（warmup）
+    def lr_lambda(epoch):
+        if epoch < args.warmup_epochs:
+            return (epoch + 1) / args.warmup_epochs
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # 訓練迴圈
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    for epoch in range(args.epochs):
+        losses = train_one_epoch(
+            model, dataloader, criterion, optimizer, device, epoch
+        )
+        scheduler.step()
+
+        # 記錄
+        print(f"\nEpoch {epoch} Summary:")
+        for key, value in losses.items():
+            print(f"  {key}: {value:.4f}")
+        print(f"  Gate value: {model.segm_modules['10'].gate.item():.4f}")
+        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+
+        # 儲存 checkpoint
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(
+                args.output_dir,
+                f'segm_epoch_{epoch+1}.pth'
+            )
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'losses': losses,
+            }, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+
+
+if __name__ == '__main__':
+    main()
+```
+
+### F.8 使用範例
+
+```python
+# 完整使用範例
+
+import torch
+from segm_v2.models.segm_vision_transformer import create_segm_dino_vitb16
+
+# 1. 創建模型
+model = create_segm_dino_vitb16(
+    pretrained_path='path/to/dinov3_vitb16.pth',
+    segm_after_blocks=[10],
+    segm_config={
+        'num_freq_bins': 32,
+        'hidden_dim': 256,
+        'kappa_init': 1.0,
+        'use_soft_modulation': True,
+        'soft_temperature': 5.0,
+        'use_periodicity_gate': True,
+    }
+)
+
+# 2. 確認參數狀態
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(f"Trainable: {name}")
+# 輸出應該只有 segm_modules.* 的參數
+
+# 3. Forward pass
+model.eval()
+with torch.no_grad():
+    images = torch.randn(2, 3, 224, 224)  # 假設輸入
+    outputs = model.forward_features(images)
+
+    # 輸出結構
+    print(outputs['x_norm_clstoken'].shape)      # (2, 768)
+    print(outputs['x_norm_patchtokens'].shape)   # (2, 196, 768)
+
+    # 獲取 SEGM 中間結果
+    segm_outputs = model.get_segm_outputs()
+    grid = segm_outputs['10']['grid']            # (2, 1, 14, 14)
+    freq_info = segm_outputs['10']['freq_info']
+    print(freq_info['dominant_freq'].shape)      # (2, 14)
+
+# 4. 視覺化 Grid
+import matplotlib.pyplot as plt
+
+grid_np = grid[0, 0].cpu().numpy()  # (14, 14)
+plt.imshow(grid_np, cmap='hot')
+plt.colorbar()
+plt.title('Periodic Grid')
+plt.savefig('grid_visualization.png')
+```

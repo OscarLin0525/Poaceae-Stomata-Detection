@@ -4,6 +4,7 @@
 
 ## 目錄
 
+0. [⭐⭐ 重構計畫：基於 DINO Teacher 的對照修改](#重構計畫基於-dino-teacher-的對照修改)
 1. [框架概述](#框架概述)
 2. [架構設計](#架構設計)
 3. [安裝與依賴](#安裝與依賴)
@@ -16,6 +17,505 @@
 10. [常見問題](#常見問題)
 11. [⭐ YOLO Student 整合指南](#yolo-student-整合指南)
 12. [⭐ 實作細節與狀態](#實作細節與狀態)
+
+---
+
+## 重構計畫：基於 DINO Teacher 的對照修改
+
+> **參考 ground truth**: `DINO_Teacher/` — *"Large Self-Supervised Models Bridge the Gap in Domain Adaptive Object Detection"* (CVPR 2025, Lavoie et al.)
+>
+> **修改目標**: `Poaceae-Stomata-Detection/mtkd_framework/`
+>
+> 本節以 DINO Teacher repo 為 ground truth，逐項對照 MTKD 的現有實作，列出所有需要修改的項目。
+
+### 0.1 可以從 DINO Teacher 直接抄的三件事
+
+DINO Teacher repo 可以直接參考的核心機制有 **三項**，不只是 feature alignment 和 prediction alignment：
+
+| # | 機制 | 說明 | 是否必要 |
+|---|------|------|---------|
+| **① Feature Alignment** | Student backbone feature 對齊 frozen DINO teacher patch feature（spatial per-pixel） | ✅ 必要 |
+| **② Pseudo-Label 對齊** | Teacher 產生 weak prediction → 門檻篩選 → 當作 target supervision 餵給 student | ✅ 必要 |
+| **③ Domain Alignment** | GRL + discriminator（source vs target domain invariance） | ⚡ 可選 |
+
+> **注意**：DINO Teacher 裡沒有獨立的 logits/KL consistency loss。它的 "prediction alignment" 實際上就是 **pseudo-label → standard detection loss**，不是 element-wise KD。
+
+---
+
+### 0.2 Feature Alignment：要抄的核心程式碼
+
+以下是 DINO Teacher 中 feature alignment 的完整鏈路，每一步都需要在 MTKD 中有對應實作：
+
+#### 0.2.1 Config 參數
+
+**來源**: `DINO_Teacher/dinoteacher/config.py` (L58-L70)
+
+```python
+_C.SEMISUPNET.USE_FEATURE_ALIGN = False
+_C.SEMISUPNET.FEATURE_ALIGN_LAYER = 'res4'          # 要抓哪一層 backbone feature
+_C.SEMISUPNET.ALIGN_MODEL = "dinov2_vitb14"          # frozen DINO model
+_C.SEMISUPNET.DINO_PATCH_SIZE = 14
+_C.SEMISUPNET.ALIGN_HEAD_TYPE = "attention"           # attention / MLP / MLP3 / linear
+_C.SEMISUPNET.ALIGN_HEAD_PROJ_DIM = 1024
+_C.SEMISUPNET.ALIGN_PROJ_GELU = False
+_C.SEMISUPNET.ALIGN_HEAD_NORMALIZE = True             # L2 normalize features
+_C.SEMISUPNET.ALIGN_EASY_ONLY = True                  # teacher 只看 weak augmentation
+_C.SEMISUPNET.FEATURE_ALIGN_TARGET_START = 5000       # 多少 iter 後開始 target alignment
+_C.SEMISUPNET.FEATURE_ALIGN_LOSS_WEIGHT = 1.0
+_C.SEMISUPNET.FEATURE_ALIGN_LOSS_WEIGHT_TARGET = 1.0
+```
+
+**MTKD 對應**: 目前散落在 `train.py` 的 `get_default_config()` 裡，缺少 `ALIGN_HEAD_TYPE`、`ALIGN_EASY_ONLY`、`FEATURE_ALIGN_TARGET_START` 等關鍵參數。
+
+#### 0.2.2 DINO Teacher Feature Extractor（frozen）
+
+**來源**: `DINO_Teacher/dinoteacher/engine/build_dino.py` — class `DinoVitFeatureExtractor` (L29) + `forward()` (L103-L125)
+
+核心流程：
+1. **預處理** (L36-L38 init, L105-L110 forward) — BGR→RGB + ImageNet normalize (`mean=[123.675, 116.280, 103.530]`, `std=[58.395, 57.120, 57.375]`)
+2. **Pad** (L109) — `ImageList.from_tensors(x, patch_size)` pad 到 `patch_size` 整除
+3. **Feature extraction** (L118) — `encoder.get_intermediate_layers(x)[0]` → `[B, num_patches, D]`
+4. **Strip CLS token** (L119-L120) —（DINOv1 才需要，`x[:,1:,:]`）
+5. **L2 normalize** (L122-L123) — `F.normalize(x, p=2, dim=2)` 沿 embedding dim
+6. **Reshape** (L125) — `.view(B, D, f_height, f_width)` → `[B, D, H/p, W/p]` 回到 **spatial feature map**
+
+**MTKD 現狀 (`mtkd_model.py` L149 `DINOFeatureTeacher.forward`)**: ❌ 沒有預處理、❌ 沒有 pad、❌ 沒有 reshape 成 spatial、❌ 只回傳 CLS token 做對齊
+
+#### 0.2.3 Alignment Head（projection + loss）
+
+**來源**: `DINO_Teacher/dinoteacher/engine/align_head.py` (L9-L62)
+
+`TeacherStudentAlignHead`:
+- **Projection**: 全部用 `nn.Conv2d(1×1)` — 在 spatial feature map 上做 per-pixel projection
+  - `attention`: MHA self-attention + Conv2d
+  - `MLP`: Conv2d → ReLU → Conv2d
+  - `MLP3`: Conv2d → ReLU → Conv2d → ReLU → Conv2d
+  - `linear`: 單一 Conv2d
+- **Spatial interpolation**: `F.interpolate(projected, (h, w), mode='bilinear')` 對齊到 DINO 空間解析度
+- **Post-norm**: `F.normalize(p=2, dim=1)` 沿 channel 維度
+- **Loss**: 如果 normalized → per-pixel dot product cosine loss `(1 - s·t).mean()`；否則 → L2 / 100
+
+**MTKD 現狀 (`student_model.py` L21-L117)**: ❌ 用 `nn.Linear` 不是 `nn.Conv2d`、❌ 無 spatial interpolation、❌ global avg pool 把空間資訊丟掉了
+
+#### 0.2.4 Trainer 掛載 + Hook
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L65-L80, L661-L668)
+
+Trainer init 中：
+```python
+# 取 student backbone 在 align_layer 的 channel 數
+student_align_dim = model.backbone._out_feature_channels[FEATURE_ALIGN_LAYER]
+# 取 DINO teacher 的 embed_dim
+teacher_align_dim = [*model.align_teacher.modules()][-2].normalized_shape[0]
+# 建 alignment head
+model.align_student_head = TeacherStudentAlignHead(cfg, student_align_dim, teacher_align_dim, ...)
+# 在 proposal_generator 上掛 forward hook，自動抓 backbone feature
+self._register_input_hook_feat_align(model, 'proposal_generator')
+```
+
+Hook 機制 (L661-L662)：
+```python
+def _get_detector_input_hook(self, module, input, output):
+    # input[1] 是 backbone feature dict，[RPN_IN_FEATURES[0]] 取出指定層
+    self.student_align_feat[self.branch] = input[1][self.cfg.MODEL.RPN.IN_FEATURES[0]]
+```
+
+**MTKD 現狀**: 在 `yolo_wrappers.py` 掛了 pre-hook 抓 neck features，但之後 **global avg pool** 掉了。應改為直接傳出 spatial feature map。
+
+#### 0.2.5 Source/Target Align Loss 計算
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L454-L492)
+
+```python
+# === Source alignment（始終啟用） ===
+if ALIGN_EASY_ONLY:
+    teacher_feat = align_teacher(label_data_k)           # weak aug only
+    teacher_feat = teacher_feat.repeat(2,1,1,1)          # 複製給 strong+weak
+else:
+    teacher_feat = align_teacher(all_label_data)
+
+student_feat = align_student_head(
+    hooked_backbone_feat['supervised'],                   # 從 hook 拿
+    teacher_feat.shape[2:])                               # 目標空間尺寸
+loss_align = align_student_head.align_loss(student_feat, teacher_feat)
+
+# === Target alignment（iter >= FEATURE_ALIGN_TARGET_START 才啟用） ===
+if iter >= FEATURE_ALIGN_TARGET_START:
+    teacher_feat_target = align_teacher(unlabel_data_k)   # target domain
+    student_feat_target = align_student_head(
+        hooked_backbone_feat['supervised_target'],
+        teacher_feat_target.shape[2:])
+    loss_align_target = align_student_head.align_loss(
+        student_feat_target, teacher_feat_target)
+```
+
+**MTKD 現狀**: 直接在 `MTKDModel.forward()` 裡比對 `adapted_features`（global pooled）和 `cls_token`（DINO CLS）。沒有 source/target 分離、沒有 easy-aug-only。
+
+#### 0.2.6 `forward_backbone` shortcut
+
+**來源**: `DINO_Teacher/dinoteacher/modeling/meta_arch/rcnn.py` (L44-L47)
+
+```python
+def forward_backbone(self, batched_inputs):
+    images = self.preprocess_image(batched_inputs)
+    features = self.backbone(images.tensor)
+    return features
+```
+
+用途：在 target alignment 的早期階段（`has_target_backbone_feats == 0`），unlabel data 沒有經過 student detection forward，所以需要單獨跑 backbone 取 feature。
+
+**MTKD 現狀**: 不需要此 shortcut，因為 YOLO student 的 forward 已經會回傳 neck features。但需要確保在 burn-in 期間也能拿到 target 圖片的 backbone features。
+
+---
+
+### 0.3 Pseudo-Label 對齊：要抄的核心程式碼
+
+DINO Teacher 的 "prediction alignment" 本質上是用 pseudo-labels 做 supervised loss，**不是** element-wise logits KD。
+
+#### 0.3.1 Teacher 產生 Weak Prediction
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L360-L401)
+
+兩種 pseudo-label 來源：
+
+**來源 A — VFM Labeller（預先生成）**:
+```python
+# 從 pickle 檔載入 DINO ViT fine-tuned 的預測
+instances = self.dino_pseudogt[image_id]['instances_dino']
+# 用 transform data 對齊到 augmented image 座標
+boxes = x['tf_data'].apply_box(y.pred_boxes)
+```
+
+**來源 B — EMA Mean Teacher（線上生成）**:
+```python
+with torch.no_grad():
+    _, proposals_rpn, proposals_roih, _ = self.model_teacher(
+        unlabel_data_k, branch="unsup_data_weak")  # weak augmentation!
+```
+
+#### 0.3.2 門檻篩選
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L233-L288)
+
+```python
+def threshold_bbox(self, proposal_bbox_inst, thres=0.7, proposal_type="roih"):
+    valid_map = proposal_bbox_inst.scores > thres
+    new_proposal_inst.gt_boxes = Boxes(new_bbox_loc)
+    new_proposal_inst.gt_classes = pred_classes[valid_map]
+    new_proposal_inst.scores = scores[valid_map]
+    return new_proposal_inst
+```
+
+支援三種 proposal type：`rpn`（objectness）、`roih`（ROI head scores）、`dino`（VFM scores）
+
+#### 0.3.3 塞回 Unlabeled Batch
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L403-L412)
+
+```python
+# 把 pseudo-labels 當作 gt 塞回 unlabeled data
+unlabel_data_q = self.add_label(
+    unlabel_data_q, joint_proposal_dict["proposals_pseudo_roih"])
+```
+
+`add_label()` 就是把 filterd pseudo instances 塞到 `datum["instances"]` 欄位，跟 ground truth 格式完全一樣。
+
+#### 0.3.4 用 `supervised_target` 分支算 Pseudo Loss
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L421-L428)
+
+```python
+self.branch = "supervised_target"
+record_all_unlabel_data, _, _, _ = self.model(
+    all_unlabel_data, branch="supervised_target")
+# 把 key 加上 _pseudo 後綴
+for key in record_all_unlabel_data.keys():
+    new_record[key + "_pseudo"] = record_all_unlabel_data[key]
+```
+
+實際上跟 supervised loss 走**完全相同的 detection loss**（RPN cls/loc + ROI cls/reg），只是資料換成 pseudo-labeled 的。
+
+#### 0.3.5 Pseudo Loss 權重
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L498-L522)
+
+```python
+for key in record_dict.keys():
+    if key == "loss_rpn_loc_pseudo" or key == "loss_box_reg_pseudo":
+        loss_dict[key] = record_dict[key] * 0              # pseudo bbox regression 歸零!
+    elif key[-6:] == "pseudo":
+        loss_dict[key] = record_dict[key] * UNSUP_LOSS_WEIGHT  # default: 4.0
+    elif key == "loss_align":
+        loss_dict[key] = record_dict[key] * FEATURE_ALIGN_LOSS_WEIGHT       # default: 1.0
+    elif key == "loss_align_target":
+        loss_dict[key] = record_dict[key] * FEATURE_ALIGN_LOSS_WEIGHT_TARGET # default: 1.0
+    else:  # supervised loss
+        loss_dict[key] = record_dict[key] * 1
+```
+
+**關鍵細節**：pseudo bbox regression loss 被設為 **0**（只保留 classification），supervised loss 權重 **1.0**，pseudo loss 權重 **4.0**。
+
+**MTKD 現狀**: `PredictionAlignmentLoss` 嘗試 element-wise 比對 student/teacher predictions（`[B, N, 4]` vs `[B, N, 4]`），但因 shape mismatch 會 crash。且完全沒有 GT supervised loss（`_compute_detection_loss` 回傳 0）。
+
+---
+
+### 0.4 Domain Alignment（可選）
+
+**來源**: `DINO_Teacher/dinoteacher/engine/trainer.py` (L436-L451)，繼承自 Adaptive Teacher
+
+- 用 GRL (Gradient Reversal Layer) + image-level discriminator
+- Source weak + Target weak 一起送入 `branch="domain"`
+- 損失：`loss_D_img_s` + `loss_D_img_t`，權重 `DIS_LOSS_WEIGHT`（default 0.1）
+- 控制開關：`self.use_adversarial_invariance = DIS_LOSS_WEIGHT > 0`
+
+**MTKD 現狀**: 完全沒有 domain alignment 實作。若未來需 domain adaptation（如 wheat→barley），可加入。
+
+---
+
+### 0.5 MTKD 現存問題清單
+
+#### Critical（不修會壞 / 結果無意義）
+
+| # | 問題 | 位置 | DINO Teacher 對照 |
+|---|------|------|-------------------|
+| **C1** | Feature alignment 是 global CLS-token-level（每張圖一個 768-d 向量），丟失所有空間資訊 | `yolo_wrappers.py` L204 → `global_pool(feat).flatten(1)` | `align_head.py` 整個檔案：per-pixel Conv2d + spatial interpolation |
+| **C2** | DINO teacher forward 缺少 ImageNet 預處理 — features 無意義 | `mtkd_model.py` L149 (`DINOFeatureTeacher.forward`) | `build_dino.py` L36-L38 (preprocessing init), L103-L125 (forward) |
+| **C3** | Prediction alignment shape mismatch — YOLO `[B, 8400, 4]` vs Teacher `[B, ~50, 4]` 直接 crash | `prediction_alignment.py` L428-L438 (`PredictionAlignmentLoss.forward`) | 不存在此問題：pseudo-labels 走 standard detection loss |
+| **C4** | Detection loss 是空殼函數，return 0.0 — student 沒有 GT supervision | `mtkd_model.py` L432-L470 (`_compute_detection_loss`) | `trainer.py` L415-L418: supervised branch 是整個 framework 的基礎 |
+
+#### Major（影響訓練效果）
+
+| # | 問題 | 位置 | DINO Teacher 對照 |
+|---|------|------|-------------------|
+| **M1** | Projection head 用 `nn.Linear` 而非 `nn.Conv2d` | `student_model.py` L21-L117 (`FeatureAdapter`) | `align_head.py` L19-L34: Conv2d(1×1) |
+| **M2** | 缺少 progressive training（burn-in → alignment → full） | `train.py` 整體 | `trainer.py` L325-L342: 三階段 |
+| **M3** | 無 weak/strong augmentation 區分 | `train.py` 整體 | `trainer.py` L315-L317: `data_q`(strong) / `data_k`(weak) |
+| **M4** | 無 EMA teacher update | 無 | `trainer.py` L576-L594: `_update_teacher_model(keep_rate=0.9996)` |
+
+#### Dead Code（~60% 的 loss/model code 從未執行）
+
+| Code | 位置 | 原因 |
+|------|------|------|
+| `HungarianMatchingLoss` | `prediction_alignment.py` L466-657 | 從未實例化 |
+| `AdaptiveMTKDLoss` | `combined_loss.py` L255-310 | 從未實例化 |
+| `UncertaintyWeightedMTKDLoss` | `combined_loss.py` L313-425 | 從未實例化 |
+| `StudentDetector` / `StudentBackbone` / `DetectionHead` / `SimpleFPN` | `student_model.py` | 用 YOLO，這些全不使用 |
+| `PlaceholderDINO` | `mtkd_model.py` L90-107 | Conv2d ≠ DINO |
+| `SoftNMS` | `teacher_ensemble.py` L200-290 | 預設 WBF |
+| `MultiScaleFeatureAdapter` 使用面 | `student_model.py` L127-151 | 只在 dead code StudentDetector 裡 |
+| `AttentionAlignmentLoss` 使用路徑 | `combined_loss.py` L227-231 | `use_attention_alignment=False`，無 attention maps |
+| Token matching 觸發條件 | `combined_loss.py` L213 | `dim() == 3` 永遠不成立 |
+| `_compute_detection_loss` | `mtkd_model.py` L436-470 | 函數內容全是 `pass`，return 0 |
+| `freeze/unfreeze_student_backbone` | `mtkd_model.py` L553-564 | 從未呼叫 |
+
+#### 小 Bug
+
+| Bug | 位置 | 修復方式 |
+|-----|------|---------|
+| `config.pop("embed_dim")` 汙染原 dict | `mtkd_model.py` L253 | 改 `config.get()` 或 `copy()` |
+| `_get_device()` 在無 parameter 時 crash | `combined_loss.py` L248 | 改用 `self.current_epoch.device` |
+| YOLO eval-mode forward 影響 BN | `yolo_wrappers.py` L148-158 | Training 中 BN 用 running stats 不合理 |
+| Ensemble logit 重建效率低且語義有誤 | `teacher_ensemble.py` L620-635 | 改 pseudo-label 後可刪 |
+
+---
+
+### 0.6 修改計畫（按優先序）
+
+> **原則**：先讓 student 學得動（GT loss），再讓 teacher signal 正確（preprocessing + pseudo-label），最後提升 alignment 品質（spatial）。沒有 GT supervision 的 student backbone 根本不會學東西，後面的 KD 都是空轉。
+
+#### Step 1 — 修復 Detection Loss（GT Supervision）🔴 最高優先
+
+**修改**: `mtkd_framework/models/mtkd_model.py` — `_compute_detection_loss()`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| 接上 YOLO 內建 loss（CIoU + BCE + DFL） | `trainer.py` L415-L418: supervised branch 就是 standard detection loss |
+| 確保 GT supervision 始終存在 | DINO Teacher 的 supervised loss 是基礎，KD 只是輔助 |
+
+**為什麼第一步**：目前 `_compute_detection_loss` 回傳 0（`mtkd_model.py` L432-L470 全是 `pass`），student 沒有 gradient signal，backbone 不會更新。所有 alignment / KD 訓號都在對齊一個「凍結的隨機 backbone」。
+
+#### Step 2 — 修復 DINO Teacher 預處理 ⟵ `build_dino.py` 🔴
+
+**修改**: `mtkd_framework/models/mtkd_model.py` — `DINOFeatureTeacher`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| 加 ImageNet mean/std normalize | `build_dino.py` L17-L27 (`dino_preprocessing` class) |
+| BGR→RGB 轉換（如果需要） | `build_dino.py` L105-L106 |
+| Pad 到 `patch_size` 整除 | `build_dino.py` L109 |
+| Reshape patch tokens 成 spatial `[B, D, h, w]` | `build_dino.py` L125 |
+| L2 normalize 沿 embedding dim | `build_dino.py` L122-L123 |
+
+**為什麼第二步**：5 分鐘修復但影響巨大。沒有正確的預處理，DINO ViT 輸出的 features 毫無語義，feature alignment loss 在對齊垃圾。即使暫時保留 global alignment，這步也要先做。
+
+#### Step 3 — 改 Prediction Alignment 為 Pseudo-Label 方式 ⟵ `trainer.py` L379-L520 🟠
+
+**修改**: `mtkd_framework/models/mtkd_model.py`, `mtkd_framework/losses/prediction_alignment.py`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| Ensemble teacher predictions → threshold 篩選 → pseudo-labels | `trainer.py` L233-L270 (`threshold_bbox`) |
+| 把 pseudo-labels 轉成 YOLO target 格式（normalized xywh + class） | `trainer.py` L405-L412 (`add_label`) |
+| 用 standard YOLO detection loss 計算 pseudo loss | `trainer.py` L421-L428 (`supervised_target` branch) |
+| Pseudo bbox regression loss × 0（只留 classification） | `trainer.py` L499-L501 |
+| Pseudo loss 權重 = `UNSUP_LOSS_WEIGHT`（default 4.0） | `trainer.py` L503-L505 |
+| 移除 `PredictionAlignmentLoss` 的 element-wise 對齊 | — |
+
+**為什麼第三步**：這是 DINO Teacher 和 MTKD「差最多」的地方。element-wise KD（8400 vs ~50）根本跑不動；改成 pseudo-label supervision 才是 DINO Teacher 成效的核心路線。
+
+#### Step 4 — 加入 Progressive Training ⟵ `trainer.py` L325-L342 🟠
+
+**修改**: `mtkd_framework/train.py`
+
+| 階段 | 條件 | 內容 | 參考 |
+|------|------|------|------|
+| **Burn-in** | `iter < BURN_UP_STEP` (default 12000) | GT supervised loss + DINO feature alignment only | `trainer.py` L332-L340 |
+| **Full training** | `iter >= BURN_UP_STEP` | + pseudo-label loss + (optional) target alignment | `trainer.py` L347-L432 |
+
+**為什麼第四步**：Pseudo-label 在 student 還沒訓好時品質很差。DINO Teacher 讓 student 先 burn-in 再引入 pseudo-labels，避免 noisy labels 毒害早期訓練。
+
+#### Step 5 — Weak/Strong 雙流 Dataset ⟵ `dataset_mapper.py` 🟡
+
+**修改**: `mtkd_framework/data/stomata_dataset.py` + 新增 `mtkd_framework/data/dual_augment.py`
+
+DINO Teacher 用 `DatasetMapperTwoCropSeparateKeepTf`（`dinoteacher/data/dataset_mapper.py` L168-L350）：每張圖同時產出 strong + weak 兩個版本，且保留 transform trace 供 pseudo box 座標映射。
+
+| 要做的事 | 參考來源 | MTKD 現狀 |
+|---------|---------|----------|
+| 每張圖產出 `(data_q, data_k)` — strong/weak 兩份 | `dataset_mapper.py` L316-L340：weak 是原始 augmentation，strong 再加 color jitter/grayscale/blur | `stomata_dataset.py` L124：只有單張 + 隨機水平翻轉 |
+| Strong augmentation 包含 color jitter + random grayscale + Gaussian blur | `adapteacher/data/detection_utils.py` `build_strong_augmentation()` | 無 |
+| 保留 `tf_data = transforms`（geometric transform trace） | `dataset_mapper.py` L315：`dataset_dict['tf_data'] = transforms` | 無 |
+| DataLoader 每個 batch 解包為 `label_q, label_k, unlabel_q, unlabel_k` | `trainer.py` L317：`label_data_q, label_data_k, unlabel_data_q, unlabel_data_k = data` | 單一 batch |
+| Teacher 只看 weak（`_k`）做 inference，pseudo box 放在 strong（`_q`）上做 loss | `trainer.py` L380：`model_teacher(unlabel_data_k, branch="unsup_data_weak")` | 不區分 |
+| `tf_data.apply_box()` 把預生成 pseudo box 映射到 augmented image 座標 | `trainer.py` L363：`x['tf_data'].apply_box(y.pred_boxes)` | 不需要（MTKD 是 online inference，不是 offline labels） |
+
+**MTKD 簡化方案**：因為 MTKD 的 ensemble teacher 是 frozen 且 online inference（不是 offline labeller），所以：
+- `tf_data` transform trace **不需要**（teacher 直接看 weak image 做 forward，box 座標已在 weak image 空間）
+- 只需要實作 **weak/strong 雙流 augmentation** + **labeled/unlabeled 分流**
+- Weak: 基本 resize + flip
+- Strong: weak + ColorJitter + RandomGrayscale + GaussianBlur（參考 `build_strong_augmentation()`）
+- DataLoader 改為每 batch 回傳 `(labeled_strong, labeled_weak, unlabeled_strong, unlabeled_weak)`
+
+#### Step 6 — 改 Feature Alignment 為 Spatial Map 對齊 🟡
+
+分為三個子步驟：
+
+##### Step 6a — 新增 SpatialAlignHead ⟵ `align_head.py`
+
+**新增**: `mtkd_framework/models/align_head.py`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| Conv2d(1×1) projection（MLP / MLP3 / attention / linear） | `align_head.py` L19-L34 |
+| `F.interpolate(bilinear)` 到 teacher spatial size | `align_head.py` L43 |
+| Post-projection L2 normalize | `align_head.py` L44-L45 |
+| Per-pixel cosine loss: `(1 - dot_product).mean()` | `align_head.py` L48-L62 |
+
+##### Step 6b — 改 Student 輸出為 Spatial Feature Map
+
+**修改**: `mtkd_framework/models/yolo_wrappers.py`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| 移除 `global_pool` + `flatten` + `FeatureAdapter` | — |
+| 直接輸出 P4 spatial feature map `[B, C, H, W]` | `trainer.py` L661: hook 直接抓 spatial |
+| 在 `MTKDModel` 中建立 `SpatialAlignHead` 並用它做 projection + loss | `trainer.py` L65-L75 |
+
+##### Step 6c — Source/Target 分離 + easy-aug-only
+
+**修改**: `mtkd_framework/models/mtkd_model.py`, `mtkd_framework/losses/combined_loss.py`
+
+| 要做的事 | 參考來源 |
+|---------|---------|
+| Source alignment: teacher 只看 weak aug（`ALIGN_EASY_ONLY`）| `trainer.py` L456-L459 |
+| Target alignment: `iter >= FEATURE_ALIGN_TARGET_START` 才啟用 | `trainer.py` L467-L492 |
+| 兩個 alignment loss 分開加權 | `trainer.py` L515-L518 |
+
+#### Step 7 — 清理 Dead Code
+
+刪除所有從未執行的代碼（見 0.5 Dead Code 清單），精簡 framework。
+
+#### 修改順序總覽
+
+| 優先 | Step | 修改內容 | 影響 | 工作量 |
+|:---:|:---:|----------|------|:------:|
+| 🔴 | 1 | GT detection loss | 沒有就全部白做 | 小 |
+| 🔴 | 2 | DINO preprocessing | feature alignment 變有意義 | 小 |
+| 🟠 | 3 | Pseudo-label supervision | prediction alignment 從 broken 到 functional | 中 |
+| 🟠 | 4 | Progressive training | 避免 noisy pseudo-labels 毒害早期 | 小 |
+| 🟡 | 5 | Weak/strong 雙流 dataset | pseudo-label 品質 + teacher inference 正確性 | 中 |
+| 🟡 | 6 | Spatial feature alignment | 從 global 到 per-pixel，提升 alignment 品質 | 中 |
+| ⚪ | 7 | Dead code cleanup | 可讀性 + 維護性 | 小 |
+
+---
+
+### 0.7 修改後的架構流程圖
+
+```
+Input Image
+    │
+    ├──► Frozen DINO ViT Teacher ──► Spatial Patch Features [B, D, h, w]
+    │       (ImageNet normalize,                    │
+    │        pad to patch_size,                     │ L2 normalize (per-patch)
+    │        reshape to spatial)                    ▼
+    │                                    ┌─── Per-Pixel Cosine Loss ◄───┐
+    │                                    │    L = (1 - s·t).mean()      │
+    │                                    │                              │
+    ├──► YOLO Student ──► P4 Feature Map [B, C, H, W]                  │
+    │       │              │                                            │
+    │       │              └──► SpatialAlignHead ──► Proj [B, D, h, w] ─┘
+    │       │                   (Conv2d 1×1 + bilinear interp + L2 norm)
+    │       │
+    │       └──► Detection Output ──────┐
+    │               │                   │
+    │               ├──► GT Supervised Loss (YOLO built-in: CIoU + BCE + DFL)
+    │               │
+    │               └──► Pseudo-Label Supervised Loss
+    │                       ↑
+    │                       │ (threshold-filtered pseudo-labels as targets)
+    │                       │
+    └──► Frozen YOLO Ensemble Teacher ──► WBF Fused Predictions
+             ──► Score Threshold ──► Pseudo-Labels (gt_boxes + gt_classes)
+```
+
+**Loss 公式**:
+
+$$L_{\text{total}} = 1.0 \cdot L_{\text{supervised}} + w_{\text{align}} \cdot L_{\text{feature\_align}} + w_{\text{pseudo}} \cdot L_{\text{pseudo}} + w_{\text{align\_target}} \cdot L_{\text{target\_align}}$$
+
+其中 pseudo bbox regression loss 設為 0（只保留 classification pseudo loss）。
+
+---
+
+### 0.8 對照速查表
+
+| 功能 | DINO Teacher 參考位置 | MTKD 現狀位置 | 修改方向 | Step |
+|------|----------------------|--------------|---------|:----:|
+| **GT detection loss** | `trainer.py` L415-L418 (supervised branch) | `mtkd_model.py` L432-L470 (空殼 `pass`) | 接上 YOLO 內建 loss | 1 |
+| DINO 預處理 | `build_dino.py` L36-L38, L103-L125 | `mtkd_model.py` L149 | 加 ImageNet norm + spatial reshape | 2 |
+| Pseudo-label supervision | `trainer.py` L405-L428 (add_label → supervised_target) | `prediction_alignment.py` L425 (element-wise KD, broken) | 改為 threshold → pseudo target → detection loss | 3 |
+| Pseudo loss 權重 | `trainer.py` L495-L520 | `combined_loss.py` `prediction_weight` | 對齊分項權重（bbox reg ×0, cls ×4.0） | 3 |
+| 門檻篩選 pseudo-labels | `trainer.py` L233-L288 | `teacher_ensemble.py` score filter | 加 explicit threshold | 3 |
+| Burn-in 階段 | `trainer.py` L332-L340 | 無 | 加 progressive schedule | 4 |
+| Weak/strong 雙流 dataset | `dataset_mapper.py` L168-L350 | `stomata_dataset.py` L124 (單流 + flip only) | 新增 dual augmentation + labeled/unlabeled split | 5 |
+| Strong augmentation | `adapteacher/data/detection_utils.py` `build_strong_augmentation()` | 無 | 加 ColorJitter + RandomGrayscale + GaussianBlur | 5 |
+| Config 參數 | `config.py` L58-L79 | `train.py` `get_default_config()` | 補齊缺失參數 | 2 |
+| Align head (Conv2d spatial) | `align_head.py` L9-L62 | `student_model.py` L21-L117 (Linear) | 新增 `align_head.py` | 6a |
+| Student spatial output | `trainer.py` L661 (hook 抓 spatial) | `yolo_wrappers.py` L204 (global pool) | 改為輸出 spatial features | 6b |
+| Source feature align loss | `trainer.py` L454-L465 | `combined_loss.py` L207-L211 | 改為 spatial per-pixel | 6c |
+| Target feature align loss | `trainer.py` L467-L492 | 無 | 新增 | 6c |
+| EMA teacher 產生 weak prediction | `trainer.py` L377-L401 | 無 | 用 frozen ensemble teacher 替代 | — |
+| `forward_backbone` shortcut | `rcnn.py` L44-L47 | 無（YOLO forward 已回傳 features） | 不需要 | — |
+| Domain discriminator (可選) | `trainer.py` L436-L451 | 無 | 需要時再加 | — |
+
+---
+
+### 0.9 驗證方式
+
+1. **Unit test**: 建 `SpatialAlignHead`，確認 output shape `[B, D, h, w]` 和 loss 值 ∈ `[0, 2]`
+2. **Shape test**: `DINOFeatureTeacher` → `[B, D, h, w]`；`YOLOStudentDetector` → `[B, C, H, W]`
+3. **Integration test**: 一個 batch forward+backward，確認每個 loss 都 > 0 且 gradient 有回傳
+4. **Sanity check**: 訓練 10 epochs 觀察 loss 曲線（feature align loss 應下降，detection loss 正常收斂）
+5. **Comparison**: 修改前後比較 mAP@50，spatial alignment 應優於 global alignment
 
 ---
 
@@ -1726,17 +2226,23 @@ yolo_mtkd_config = {
 
 ### 實作狀態總覽
 
+> ⚠️ 本 framework 大部分代碼為語言模型生成，經與 DINO Teacher (CVPR 2025) 對照後發現多項架構性問題。
+> 詳見 [重構計畫](#重構計畫基於-dino-teacher-的對照修改)。
+
 | 模組 | 檔案 | 實作狀態 | 說明 |
 |------|------|---------|------|
-| **Feature Alignment Loss** | `losses/feature_alignment.py` | ✅ 完整 | L2, Cosine, KL, Smooth L1 |
-| **Prediction Alignment Loss** | `losses/prediction_alignment.py` | ✅ 完整 | GIoU, CIoU, Hungarian Matching |
-| **Combined Loss** | `losses/combined_loss.py` | ✅ 完整 | 標準版 + Adaptive + Uncertainty |
-| **Student Model (DETR)** | `models/student_model.py` | ✅ 完整 | DETR-like 架構 |
-| **Teacher Ensemble** | `models/teacher_ensemble.py` | ✅ 完整 | WBF + Soft-NMS |
-| **MTKD Model** | `models/mtkd_model.py` | ✅ 完整 | 整合所有組件 |
-| **Training Pipeline** | `train.py` | ✅ 完整 | MTKDTrainer 類別 |
-| **YOLOv8Teacher** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
-| **YOLOv11StudentDetector** | 待實作 | 🔄 規劃中 | 見 YOLO 整合指南 |
+| **Feature Alignment Loss** | `losses/feature_alignment.py` | ⚠️ 需重構 | 做的是 per-image global alignment，應改為 per-pixel spatial alignment（見 §0.2） |
+| **SpatialAlignHead** | `models/align_head.py` | ❌ 待新增 | 需仿照 `DINO_Teacher/dinoteacher/engine/align_head.py` 實作 Conv2d spatial projection |
+| **DINO Feature Teacher** | `models/mtkd_model.py` | ⚠️ 需修復 | 缺少 ImageNet 預處理 + spatial reshape（見 §0.2.2） |
+| **Prediction Alignment Loss** | `losses/prediction_alignment.py` | ❌ 需重寫 | 存在 shape mismatch crash；應改為 pseudo-label → detection loss（見 §0.3） |
+| **Combined Loss** | `losses/combined_loss.py` | ⚠️ 需精簡 | `AdaptiveMTKDLoss`、`UncertaintyWeightedMTKDLoss` 為 dead code |
+| **Student Model (DETR)** | `models/student_model.py` | 🗑️ Dead code | 預設用 YOLO，DETR 路徑從未使用 |
+| **YOLO Wrappers** | `models/yolo_wrappers.py` | ⚠️ 需修改 | 移除 global pool，改為輸出 spatial feature map |
+| **Teacher Ensemble** | `models/teacher_ensemble.py` | ⚠️ 需調整 | 需加 score threshold 篩選產出 pseudo-labels |
+| **MTKD Model** | `models/mtkd_model.py` | ⚠️ 需重構 | `_compute_detection_loss` 是空殼（return 0），需接 YOLO loss |
+| **Training Pipeline** | `train.py` | ⚠️ 需重構 | 缺少 progressive training / burn-in / weak-strong aug 分離 |
+| **YOLOv8Teacher** | `models/yolo_wrappers.py` | ✅ 已實作 | `YOLODetectionTeacher` |
+| **YOLOv11StudentDetector** | `models/yolo_wrappers.py` | ✅ 已實作 | `YOLOStudentDetector`（需修改 feature 輸出方式） |
 
 ---
 
