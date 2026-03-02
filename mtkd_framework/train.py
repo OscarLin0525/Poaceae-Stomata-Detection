@@ -18,6 +18,7 @@ from typing import Dict, Optional, Any
 import logging
 
 from .models import MTKDModel, build_mtkd_model
+from .data import build_stomata_dataloaders
 from .utils import (
     setup_logger,
     save_checkpoint,
@@ -44,28 +45,38 @@ def get_default_config() -> Dict[str, Any]:
         # 模型配置
         "model": {
             "num_classes": 1,  # 氣孔檢測為單類
+            "student_type": "yolo",
             "student_config": {
-                "backbone_config": {
-                    "backbone_type": "resnet50",
-                    "pretrained": True,
-                },
-                "head_config": {
-                    "num_classes": 1,
-                    "num_queries": 100,
-                    "hidden_dim": 256,
-                    "num_heads": 8,
-                    "num_layers": 6,
-                },
-                "adapter_config": {
-                    "adapter_type": "mlp",
-                },
+                # 建議改成你自己的 yolo11s 權重路徑 (e.g. "weights/yolo11s_stomata.pt")
+                "weights": "yolo11s.pt",
+                "feature_level": "p4",
+                "adapter_type": "mlp",
             },
             "dino_teacher_config": {
                 "model_name": "vit_base",
                 "patch_size": 16,
                 "embed_dim": 768,
             },
+            # Optional: use your semi-supervised YOLO (10% SoftTeacher) as an extra teacher.
+            "soft_teacher_config": {
+                "enabled": True,
+                "type": "yolo",
+                "weights": "10%SoftTeahcer/weights/best.pt",
+                "weight": 1.0,
+                "score_threshold": 0.001,
+                "max_detections": 300,
+            },
             "ensemble_config": {
+                "teacher_specs": [
+                    {
+                        "type": "yolo",
+                        # 建議改成你自己的 yolov8 teacher 權重路徑
+                        "weights": "yolov8s.pt",
+                        "weight": 1.0,
+                        "score_threshold": 0.001,
+                        "max_detections": 300,
+                    }
+                ],
                 "fusion_method": "wbf",
                 "fusion_config": {
                     "iou_threshold": 0.55,
@@ -106,8 +117,10 @@ def get_default_config() -> Dict[str, Any]:
         },
         # 數據配置
         "data": {
-            "train_path": "data/train",
-            "val_path": "data/val",
+            "dataset_root": "Stomata_Dataset",
+            "image_subdir": "barley_category/barley_image_fresh-leaf",
+            "label_subdir": "barley_category/barley_label_fresh-leaf",
+            "val_ratio": 0.1,
             "image_size": 640,
             "augmentation": True,
         },
@@ -493,6 +506,28 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--soft_teacher_weights",
+        type=str,
+        default=None,
+        help="Path to SoftTeacher YOLO weights (e.g. 10%SoftTeahcer/weights/best.pt)",
+    )
+    parser.add_argument(
+        "--soft_teacher_weight",
+        type=float,
+        default=None,
+        help="Ensemble fusion weight for SoftTeacher",
+    )
+    parser.add_argument(
+        "--disable_soft_teacher",
+        action="store_true",
+        help="Disable SoftTeacher teacher in ensemble",
+    )
+    parser.add_argument(
+        "--only_soft_teacher",
+        action="store_true",
+        help="Use only SoftTeacher (clear existing ensemble teacher_specs)",
+    )
     parser.add_argument("--test_run", action="store_true", help="Run with dummy data for testing")
     args = parser.parse_args()
 
@@ -519,6 +554,18 @@ def main():
         config["device"] = args.device
     if args.seed:
         config["seed"] = args.seed
+    if args.soft_teacher_weights or args.soft_teacher_weight is not None or args.disable_soft_teacher:
+        soft_cfg = config["model"].setdefault("soft_teacher_config", {})
+        if args.disable_soft_teacher:
+            soft_cfg["enabled"] = False
+        if args.soft_teacher_weights:
+            soft_cfg["enabled"] = True
+            soft_cfg["weights"] = args.soft_teacher_weights
+        if args.soft_teacher_weight is not None:
+            soft_cfg["weight"] = float(args.soft_teacher_weight)
+    if args.only_soft_teacher:
+        config["model"].setdefault("ensemble_config", {})["teacher_specs"] = []
+        config["model"].setdefault("soft_teacher_config", {})["enabled"] = True
 
     # 創建數據載入器
     if args.test_run:
@@ -533,11 +580,17 @@ def main():
         )
         config["training"]["epochs"] = 2
     else:
-        # TODO: 實現真實數據載入器
-        # train_loader = create_real_dataloader(config["data"]["train_path"], ...)
-        # val_loader = create_real_dataloader(config["data"]["val_path"], ...)
-        raise NotImplementedError(
-            "Real data loader not implemented. Use --test_run for testing or implement your own data loader."
+        data_cfg = config["data"]
+        train_loader, val_loader = build_stomata_dataloaders(
+            dataset_root=data_cfg["dataset_root"],
+            image_subdir=data_cfg.get("image_subdir", ""),
+            label_subdir=data_cfg.get("label_subdir", ""),
+            image_size=data_cfg.get("image_size", 640),
+            val_ratio=data_cfg.get("val_ratio", 0.1),
+            batch_size=config["training"]["batch_size"],
+            num_workers=config["training"].get("num_workers", 4),
+            seed=config.get("seed", 42),
+            augmentation=data_cfg.get("augmentation", True),
         )
 
     # 創建訓練器並開始訓練

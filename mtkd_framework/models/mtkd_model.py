@@ -19,6 +19,7 @@ import logging
 
 from .teacher_ensemble import TeacherEnsemble
 from .student_model import StudentDetector, FeatureAdapter
+from .yolo_wrappers import YOLOStudentDetector, YOLODetectionTeacher
 from ..losses import MTKDLoss
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,7 @@ class MTKDModel(nn.Module):
     def __init__(
         self,
         # Student configuration
+        student_type: str = "detr",
         student_config: Optional[Dict[str, Any]] = None,
         custom_student: Optional[nn.Module] = None,
         # DINO teacher configuration
@@ -257,6 +259,7 @@ class MTKDModel(nn.Module):
         dino_checkpoint: Optional[str] = None,
         # Ensemble teachers configuration
         ensemble_config: Optional[Dict[str, Any]] = None,
+        teacher_specs: Optional[List[Dict[str, Any]]] = None,
         teacher_models: Optional[List[nn.Module]] = None,
         teacher_checkpoints: Optional[List[str]] = None,
         # Loss configuration
@@ -267,6 +270,7 @@ class MTKDModel(nn.Module):
         super().__init__()
 
         self.num_classes = num_classes
+        self.student_type = student_type.lower()
 
         # =============================================================
         # 1. Initialize Student Model
@@ -277,14 +281,21 @@ class MTKDModel(nn.Module):
         else:
             student_config = student_config or {}
             dino_teacher_dim = dino_teacher_config.get("embed_dim", 768) if dino_teacher_config else 768
-            student_config.setdefault("dino_teacher_dim", dino_teacher_dim)
-            student_config.setdefault("head_config", {"num_classes": num_classes})
-            self.student = StudentDetector(**student_config)
+            if self.student_type == "yolo":
+                student_config.setdefault("dino_teacher_dim", dino_teacher_dim)
+                student_config.setdefault("num_classes", num_classes)
+                self.student = YOLOStudentDetector(**student_config)
+            else:
+                student_config.setdefault("dino_teacher_dim", dino_teacher_dim)
+                student_config.setdefault("head_config", {"num_classes": num_classes})
+                self.student = StudentDetector(**student_config)
 
         # =============================================================
         # 2. Initialize DINO Feature Teacher (Frozen)
         # =============================================================
-        dino_teacher_config = dino_teacher_config or {}
+        dino_teacher_config = dict(dino_teacher_config or {})
+        # embed_dim is consumed by student adapter sizing, not DINO constructor.
+        dino_teacher_config.pop("embed_dim", None)
         if dino_model is not None:
             self.dino_teacher = DINOFeatureTeacher(dino_model=dino_model, frozen=True)
         else:
@@ -298,6 +309,25 @@ class MTKDModel(nn.Module):
         # =============================================================
         ensemble_config = ensemble_config or {}
         ensemble_config.setdefault("num_classes", num_classes)
+
+        if teacher_models is None and teacher_specs:
+            built_teachers: List[nn.Module] = []
+            built_weights: List[float] = []
+            for spec in teacher_specs:
+                spec = dict(spec)
+                teacher_type = spec.pop("type", "yolo").lower()
+                weight = float(spec.pop("weight", 1.0))
+
+                if teacher_type == "yolo":
+                    spec.setdefault("num_classes", num_classes)
+                    built_teachers.append(YOLODetectionTeacher(**spec))
+                else:
+                    raise ValueError(f"Unsupported teacher type: {teacher_type}")
+                built_weights.append(weight)
+
+            teacher_models = built_teachers
+            if "teacher_weights" not in ensemble_config or ensemble_config["teacher_weights"] is None:
+                ensemble_config["teacher_weights"] = built_weights
 
         if teacher_models is not None:
             self.ensemble_teachers = TeacherEnsemble(
@@ -558,10 +588,53 @@ def build_mtkd_model(
         ... }
         >>> model = build_mtkd_model(config, dino_checkpoint="dino.pth")
     """
+    def _merge_soft_teacher_spec(
+        specs: List[Dict[str, Any]],
+        soft_teacher_config: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Merge optional soft-teacher config into teacher_specs."""
+        if not soft_teacher_config:
+            return specs
+
+        soft_cfg = dict(soft_teacher_config)
+        enabled = bool(soft_cfg.pop("enabled", False))
+        if not enabled:
+            return specs
+
+        weights = soft_cfg.get("weights")
+        if not weights:
+            raise ValueError("soft_teacher_config.enabled=True but weights is empty")
+
+        teacher_type = str(soft_cfg.get("type", "yolo")).lower()
+        soft_cfg["type"] = teacher_type
+
+        # Avoid adding duplicated teacher entries.
+        existing = {(str(s.get("type", "yolo")).lower(), s.get("weights")) for s in specs}
+        key = (teacher_type, weights)
+        if key not in existing:
+            specs.append(soft_cfg)
+        return specs
+
+    model_config = dict(config)
+
+    student_config = dict(model_config.get("student_config") or {})
+    student_type = model_config.get("student_type", student_config.pop("student_type", "detr"))
+
+    ensemble_config = dict(model_config.get("ensemble_config") or {})
+    teacher_specs = list(ensemble_config.pop("teacher_specs", []) or [])
+    teacher_specs = _merge_soft_teacher_spec(
+        teacher_specs,
+        model_config.get("soft_teacher_config"),
+    )
+    if len(teacher_specs) == 0:
+        teacher_specs = None
+
     return MTKDModel(
-        student_config=config.get("student_config"),
-        dino_teacher_config=config.get("dino_teacher_config"),
-        ensemble_config=config.get("ensemble_config"),
+        student_type=student_type,
+        student_config=student_config,
+        dino_teacher_config=model_config.get("dino_teacher_config"),
+        ensemble_config=ensemble_config,
+        teacher_specs=teacher_specs,
         loss_config=config.get("loss_config"),
         num_classes=config.get("num_classes", 1),
         dino_checkpoint=dino_checkpoint,
