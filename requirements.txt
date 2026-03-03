@@ -1,0 +1,39 @@
+# ==============================================================
+# Poaceae-Stomata-Detection — requirements.txt
+# ==============================================================
+
+# ---- Core ML ----
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ---- YOLO (student & teacher models) ----
+ultralytics>=8.1.0
+
+# ---- DINOv3 backbone dependencies ----
+torchmetrics
+omegaconf
+termcolor
+submitit
+ftfy
+regex
+
+# ---- Scientific computing ----
+numpy>=1.24.0
+scipy                # Hungarian matching (linear_sum_assignment)
+
+# ---- Image processing ----
+Pillow>=9.0.0
+
+# ---- Visualization & logging ----
+matplotlib
+tqdm
+
+# ---- Data / Config ----
+pandas
+PyYAML
+
+# ---- Utilities ----
+packaging
+
+# ---- Optional: Flash Attention / memory-efficient attention ----
+# xformers            # uncomment if using xformers attention in DINOv3
