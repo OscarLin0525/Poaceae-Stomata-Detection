@@ -45,7 +45,7 @@ Usage
     # --- Method 1: automatic injection ---
     inject_fft_blocks(
         dino_model,                # any model that has .blocks : nn.ModuleList
-        after_blocks=[10],         # insert after block 10  (0-indexed)
+        after_blocks=[9],          # insert after block 9  (0-indexed)
         embed_dim=768,
         n_storage_tokens=0,        # depends on the model
     )
@@ -213,7 +213,8 @@ class PluggableFFTBlock(nn.Module):
     1. Strips the ``1 + n_storage_tokens`` prefix.
     2. Reshapes patches to ``[B, H, W, C]``.
     3. Runs row-FFT → grid → modulation (with a zero-init gate).
-    4. Returns the residual ``x + gate * delta`` repacked with prefix.
+    4. Returns the residual ``x + \alpha \cdot \delta`` repacked with prefix.
+   ``\alpha = \text{sigmoid}(\text{gate})`` starts near 0 (zero-init).
 
     Parameters
     ----------
@@ -228,6 +229,8 @@ class PluggableFFTBlock(nn.Module):
         Internal hidden dimension.
     init_gate : float
         Initial gate logit.  ``sigmoid(-5) ≈ 0.007`` → near-identity.
+        This is the *tuning coefficient* (α) in the residual
+        ``output = x + α · δ``.
     modulation_mode : str
         ``"multiplicative"`` or ``"additive"``.
     """
@@ -297,23 +300,26 @@ class PluggableFFTBlock(nn.Module):
             W,
         )  # [B, 1, H, W]
 
-        gate_val = torch.sigmoid(self.gate)
+        # ---- Residual connection: output = x + α · δ(x) ----
+        alpha = torch.sigmoid(self.gate)  # tuning coefficient, starts near 0
 
         if self.modulation_mode == "multiplicative":
+            # δ = x ⊙ grid_centered  (feature-dependent modulation)
             grid_centered = (grid - 0.5) * 2  # -> [-1, 1]
             grid_for_mult = grid_centered.permute(0, 2, 3, 1)  # [B, H, W, 1]
-            modulation = 1.0 + gate_val * grid_for_mult
-            enhanced = spatial * modulation
+            delta = spatial * grid_for_mult
         else:
+            # δ = proj(grid)  (input-independent additive offset)
             proj_grid = self.channel_proj(grid)               # [B, C, H, W]
-            proj_grid = proj_grid.permute(0, 2, 3, 1)          # [B, H, W, C]
-            enhanced = spatial + gate_val * proj_grid
+            delta = proj_grid.permute(0, 2, 3, 1)              # [B, H, W, C]
+
+        enhanced = spatial + alpha * delta
 
         enhanced_patches = enhanced.reshape(B, N_patches, C)
 
         self._cache = {
             "grid": grid,
-            "gate_value": gate_val,
+            "gate_value": alpha,
             "freq_info": freq_info,
         }
 

@@ -256,6 +256,62 @@ class MTKDModelV2(nn.Module):
         return result
 
     # ------------------------------------------------------------------
+    # Training-mode forward  (single pass, multiple losses)
+    # ------------------------------------------------------------------
+    def forward_train(
+        self,
+        images: torch.Tensor,
+        gt_yolo_batch: Dict[str, torch.Tensor],
+        compute_dino: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Efficient training forward:
+
+        1. Run student in **train mode** → raw predictions + P3/P4/P5.
+        2. Compute GT detection loss from ``gt_yolo_batch``.
+        3. Run frozen DINO → teacher spatial features (optional).
+
+        Pseudo-label loss should be computed **separately** by the trainer
+        using ``student.compute_loss(out["raw_preds"], pseudo_batch)``
+        so that loss hyper-parameters can be temporarily modified
+        (e.g. ``zero_pseudo_box_reg``).
+
+        Args:
+            images:         ``[B, 3, H, W]``.
+            gt_yolo_batch:  YOLO batch dict (``batch_idx/cls/bboxes``).
+            compute_dino:   Whether to forward the frozen DINO teacher.
+
+        Returns:
+            dict with ``raw_preds``, ``det_loss``, ``det_loss_items``,
+            ``student_spatial_feat``, ``dino_features``.
+        """
+        # ---- Student raw forward (train mode) ----
+        raw_preds, student_feats = self.student.forward_train_raw(images)
+
+        # ---- GT detection loss ----
+        det_loss, det_items = self.student.compute_loss(raw_preds, gt_yolo_batch)
+
+        # ---- Extract spatial feature for alignment ----
+        feat_key = f"{self.student_align_layer}_features"
+        student_spatial = student_feats.get(feat_key)
+        if student_spatial is not None:
+            self._ensure_align_head(student_spatial.shape[1], student_spatial.device)
+
+        # ---- Frozen DINO teacher ----
+        dino_feat: Optional[torch.Tensor] = None
+        if compute_dino:
+            with torch.no_grad():
+                dino_feat = self.dino_teacher(images)  # [B, D, H_p, W_p]
+
+        return {
+            "raw_preds": raw_preds,
+            "det_loss": det_loss,
+            "det_loss_items": det_items,
+            "student_spatial_feat": student_spatial,
+            "dino_features": dino_feat,
+        }
+
+    # ------------------------------------------------------------------
     # Alignment helpers (called by the Trainer, not forward)
     # ------------------------------------------------------------------
     def compute_align_loss(
