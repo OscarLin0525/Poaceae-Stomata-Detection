@@ -114,9 +114,9 @@ class DinoFeatureExtractor(nn.Module):
     ) -> nn.Module:
         """Try DINOv3 first, fall back to DINOv2, else raise."""
 
-        # --- DINOv3 hub  (dinov3-main/dinov3/hub/backbones.py) ---
+        # --- DINOv3 hub  (dinov3-main/dinov3/models/vision_transformer.py) ---
         try:
-            from dinov3.models import vit_small, vit_base, vit_large
+            from dinov3.models.vision_transformer import vit_small, vit_base, vit_large
 
             _v3_map = {
                 "vit_small": vit_small,

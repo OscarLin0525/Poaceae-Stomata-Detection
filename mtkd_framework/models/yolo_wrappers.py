@@ -256,9 +256,10 @@ class YOLOStudentDetector(nn.Module):
         """
         self._last_neck_features = None
         self.det_model.train()
-        # _predict_once runs all layers including Detect;
-        # in train mode Detect returns raw features (not decoded).
-        raw_preds = self.det_model.predict(images)
+        # In train mode the Detect head returns raw predictions (not decoded).
+        # Use direct __call__ (nn.Module forward), NOT .predict() which is
+        # the high-level Ultralytics inference API with NMS/postprocessing.
+        raw_preds = self.det_model(images)
 
         features: Dict[str, torch.Tensor] = {}
         if self._last_neck_features is not None and len(self._last_neck_features) >= 3:

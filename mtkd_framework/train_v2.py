@@ -447,6 +447,15 @@ class MTKDTrainerV2:
             compute_dino=need_teacher_feat,
         )
 
+        # ----- Add align head params to optimizer if just lazily created -----
+        if getattr(self.model, "_align_head_just_created", False):
+            self.optimizer.add_param_group({
+                "params": list(self.model.align_head.parameters()),
+                "lr": self.config["training"]["learning_rate"],
+            })
+            self.model._align_head_just_created = False
+            self.logger.info("Added alignment head parameters to optimizer")
+
         # ----- Detection loss (GT supervision) -----
         det_loss = out["det_loss"]       # already = (box+cls+dfl)*B
         det_items = out["det_loss_items"]  # detached [box, cls, dfl]

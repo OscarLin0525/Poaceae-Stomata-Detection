@@ -204,6 +204,8 @@ class MTKDModelV2(nn.Module):
             f"teacher_dim={self._align_head_teacher_dim}, "
             f"head_type={cfg['head_type']}"
         )
+        # Flag so the trainer can add these params to the optimizer
+        self._align_head_just_created = True
 
     # ------------------------------------------------------------------
     # Forward
