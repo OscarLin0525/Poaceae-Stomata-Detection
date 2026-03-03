@@ -21,7 +21,7 @@ from .grid_generator import PeriodicGridGenerator
 
 from .segm_adapter import SEGMAdapter
 
-from .segm_vision_transformer import SEGMDinoVisionTransformer
+from .segm_vision_transformer import SEGMDinoVisionTransformer, create_segm_dino
 
 __all__ = [
     "reshape_patch_tokens_to_spatial",
@@ -30,4 +30,5 @@ __all__ = [
     "PeriodicGridGenerator",
     "SEGMAdapter",
     "SEGMDinoVisionTransformer",
+    "create_segm_dino",
 ]

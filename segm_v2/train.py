@@ -436,6 +436,17 @@ def parse_args():
                         help="DINO 模型類型")
     parser.add_argument("--segm_blocks", type=int, nargs="+", default=[10],
                         help="在哪些 Block 後插入 SEGM")
+    parser.add_argument("--use_fft_filter", action="store_true",
+                        help="在 SEGM Adapter 中啟用 2D FFT FilterBank")
+    parser.add_argument("--fft_filter_type", type=str, default="highpass",
+                        choices=["highpass", "bandpass"],
+                        help="FFT 濾波類型")
+    parser.add_argument("--fft_cutoff", type=float, default=0.2,
+                        help="FFT cutoff（0~1）")
+    parser.add_argument("--fft_bandwidth", type=float, default=0.15,
+                        help="bandpass 頻寬（0~1）")
+    parser.add_argument("--fft_strength", type=float, default=0.5,
+                        help="FFT 濾波混合強度（0~1）")
 
     # 訓練
     parser.add_argument("--epochs", type=int, default=50,
@@ -494,11 +505,29 @@ def main():
 
     # 建立模型
     print("\n建立模型...")
+    segm_config = {
+        "use_fft_filter": args.use_fft_filter,
+        "fft_filter_type": args.fft_filter_type,
+        "fft_cutoff": args.fft_cutoff,
+        "fft_bandwidth": args.fft_bandwidth,
+        "fft_strength": args.fft_strength,
+    }
+
     model = create_segm_dino(
         model_name=args.model,
         pretrained=True,
         segm_after_blocks=args.segm_blocks,
+        segm_config=segm_config,
         device=device,
+    )
+
+    print(
+        "SEGM FFT 設定: "
+        f"enabled={args.use_fft_filter}, "
+        f"type={args.fft_filter_type}, "
+        f"cutoff={args.fft_cutoff}, "
+        f"bandwidth={args.fft_bandwidth}, "
+        f"strength={args.fft_strength}"
     )
 
     # 建立損失函數
