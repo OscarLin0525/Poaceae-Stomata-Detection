@@ -209,6 +209,93 @@ class YOLOStudentDetector(nn.Module):
         outputs["labels"] = labels
         return outputs
 
+    # ------------------------------------------------------------------
+    # Training-mode forward (for v8DetectionLoss)
+    # ------------------------------------------------------------------
+    def _ensure_criterion(self):
+        """Lazy-init YOLO detection loss using the model's own ``init_criterion``."""
+        if hasattr(self, "_criterion") and self._criterion is not None:
+            return
+        # v8DetectionLoss reads model.args for hyp (box/cls/dfl gains).
+        # Ensure args exist even when loading weights for inference only.
+        if not hasattr(self.det_model, "args") or self.det_model.args is None:
+            from types import SimpleNamespace
+
+            self.det_model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+        elif isinstance(self.det_model.args, dict):
+            from types import SimpleNamespace
+
+            raw = self.det_model.args
+            self.det_model.args = SimpleNamespace(
+                box=raw.get("box", 7.5),
+                cls=raw.get("cls", 0.5),
+                dfl=raw.get("dfl", 1.5),
+            )
+        self._criterion = self.det_model.init_criterion()
+
+    def forward_train_raw(
+        self,
+        images: torch.Tensor,
+    ) -> Tuple[object, Dict[str, torch.Tensor]]:
+        """
+        Run the student YOLO in **training mode** to obtain raw predictions
+        (before decoding) and capture neck spatial features via the Detect
+        pre-hook.
+
+        This **does not** compute any loss — call :meth:`compute_loss`
+        separately with the desired target batch(es).
+
+        Args:
+            images: ``[B, 3, H, W]``
+
+        Returns:
+            raw_preds:  Whatever the Detect head returns in train mode
+                        (list of ``[B, no, H_i, W_i]`` tensors).
+            features:   Dict with ``p3_features``, ``p4_features``,
+                        ``p5_features`` spatial feature maps.
+        """
+        self._last_neck_features = None
+        self.det_model.train()
+        # _predict_once runs all layers including Detect;
+        # in train mode Detect returns raw features (not decoded).
+        raw_preds = self.det_model.predict(images)
+
+        features: Dict[str, torch.Tensor] = {}
+        if self._last_neck_features is not None and len(self._last_neck_features) >= 3:
+            features["p3_features"] = self._last_neck_features[0]
+            features["p4_features"] = self._last_neck_features[1]
+            features["p5_features"] = self._last_neck_features[2]
+
+        return raw_preds, features
+
+    def compute_loss(
+        self,
+        raw_preds: object,
+        yolo_batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute YOLO detection loss from raw predictions and a target batch.
+
+        Can be called **multiple times** with different target batches on the
+        same ``raw_preds`` (e.g. once for GT, once for pseudo-labels).
+
+        Args:
+            raw_preds:  Output of :meth:`forward_train_raw`.
+            yolo_batch: Dict with ``batch_idx`` ``[N]``, ``cls`` ``[N, 1]``,
+                        ``bboxes`` ``[N, 4]``  (normalised cxcywh).
+
+        Returns:
+            loss:       Scalar (= ``(box + cls + dfl) * batch_size``).
+            loss_items: Detached ``[box, cls, dfl]`` for logging.
+        """
+        self._ensure_criterion()
+        return self._criterion(raw_preds, yolo_batch)
+
+    def get_loss_hyp(self, key: str) -> float:
+        """Read a loss hyperparameter (e.g. ``'box'``, ``'cls'``, ``'dfl'``)."""
+        self._ensure_criterion()
+        return getattr(self._criterion.hyp, key)
+
     @torch.no_grad()
     def get_detection_output(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         pred, _, _ = self._forward_decoded(images)

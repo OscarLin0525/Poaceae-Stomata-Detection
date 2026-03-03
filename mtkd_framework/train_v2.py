@@ -12,16 +12,20 @@ Key parallels
     2. Source alignment — add feature alignment loss (student ↔ DINO teacher).
     3. Full — add pseudo-label supervision on target domain.
 
-* **Pseudo-labels from pretrained wheat model** — supplied externally via
-  a pickle/dict (same format as DINO Teacher's ``LABELER_TARGET_PSEUDOGT``).
-  No EMA teacher is needed because the user's pretrained wheat detector
-  *is* the labeller.
+* **Pseudo-labels from pretrained wheat model** — supplied externally as
+  YOLO-format ``.txt`` files (one file per image, each line
+  ``class cx cy w h [conf]`` or OBB format). They can also be supplied as
+  a ``.csv``.  No EMA teacher is needed because the user's pretrained
+  YOLO wheat detector *is* the labeller.
 
 * **Feature alignment** follows ``TeacherStudentAlignHead`` in
   ``engine/align_head.py`` — per-pixel spatial, **not** global-pool CLS.
 
 * **Loss weighting** mirrors DINO Teacher: pseudo bbox-regression loss is
   zeroed; pseudo classification loss weighted by ``unsup_loss_weight``.
+
+* **Detection loss** — uses ``v8DetectionLoss`` from Ultralytics (CIoU +
+  BCE + DFL), invoked via ``YOLOStudentDetector.compute_loss``.
 """
 
 from __future__ import annotations
@@ -29,10 +33,10 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import pickle
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -40,6 +44,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .models.mtkd_model_v2 import MTKDModelV2, build_mtkd_model_v2
+from .engine.pseudo_labels import (
+    load_pseudo_labels_dir,
+    load_pseudo_labels_csv,
+    build_yolo_batch_from_pseudo,
+    targets_to_yolo_batch,
+)
 from .utils import (
     AverageMeterDict,
     EarlyStopping,
@@ -93,7 +103,7 @@ def get_default_config_v2() -> Dict[str, Any]:
             "student_align_layer": "p4",      # which YOLO pyramid level to align
             # FFT block injection into DINO (set None to disable)
             "fft_block_config": {
-                "after_blocks": [10],
+                "after_blocks": [9],
                 "num_freq_bins": 32,
                 "hidden_dim": 256,
                 "init_gate": -5.0,
@@ -128,10 +138,14 @@ def get_default_config_v2() -> Dict[str, Any]:
         },
         # ---- pseudo labels ----
         "pseudo_labels": {
-            # Path to .pkl produced by pretrained wheat model (or None)
-            "pickle_path": None,
+            # Directory of .txt files (YOLO format, one per image)
+            "label_dir": None,
+            # OR path to a .csv
+            "csv_path": None,
             # Confidence threshold for filtering
             "score_threshold": 0.5,
+            # Auto-convert OBB 8-coord to axis-aligned bbox
+            "convert_obb": True,
         },
         # ---- data ----
         "data": {
@@ -236,10 +250,19 @@ class MTKDTrainerV2:
         # ---- pseudo labels ----
         self.pseudo_labels: Optional[Dict] = None
         pl_cfg = config.get("pseudo_labels", {})
-        pl_path = pl_cfg.get("pickle_path")
         self.pl_score_threshold = pl_cfg.get("score_threshold", 0.5)
-        if pl_path and os.path.isfile(pl_path):
-            self.load_pseudo_labels(pl_path)
+        convert_obb = pl_cfg.get("convert_obb", True)
+
+        pl_dir = pl_cfg.get("label_dir")
+        pl_csv = pl_cfg.get("csv_path")
+        if pl_dir and os.path.isdir(pl_dir):
+            self.pseudo_labels = load_pseudo_labels_dir(
+                pl_dir, self.pl_score_threshold, convert_obb,
+            )
+        elif pl_csv and os.path.isfile(pl_csv):
+            self.pseudo_labels = load_pseudo_labels_csv(
+                pl_csv, score_threshold=self.pl_score_threshold,
+            )
 
         # ---- training state ----
         self.start_epoch = 0
@@ -251,29 +274,26 @@ class MTKDTrainerV2:
     # ------------------------------------------------------------------
     # Pseudo labels
     # ------------------------------------------------------------------
-    def load_pseudo_labels(self, pkl_path: str):
+    def load_pseudo_labels_from_dir(self, label_dir: str):
         """
-        Load pseudo-labels produced by the pretrained wheat model.
+        Load pseudo-labels from a directory of YOLO ``.txt`` files.
 
-        Expected format (same as DINO Teacher):
-          list of dicts, each with at least ``image_id`` and ``instances_dino``
-          (an object with ``.pred_boxes``, ``.scores``, ``.pred_classes``).
-
-        Or a simpler format:
-          dict  { image_id: {"boxes": Tensor, "scores": Tensor, "labels": Tensor} }
+        Each file should be named ``{image_stem}.txt`` and contain one
+        detection per line in standard YOLO format
+        (``class cx cy w h [conf]``) or OBB format.
         """
-        with open(pkl_path, "rb") as f:
-            data = pickle.load(f)
+        self.pseudo_labels = load_pseudo_labels_dir(
+            label_dir,
+            score_threshold=self.pl_score_threshold,
+        )
 
-        if isinstance(data, list):
-            self.pseudo_labels = {}
-            for entry in data:
-                self.pseudo_labels[entry["image_id"]] = entry
-        elif isinstance(data, dict):
-            self.pseudo_labels = data
-        else:
-            raise ValueError(f"Unsupported pseudo-label format: {type(data)}")
-        self.logger.info(f"Loaded {len(self.pseudo_labels)} pseudo-labels from {pkl_path}")
+    def load_pseudo_labels_from_csv(self, csv_path: str, **kwargs):
+        """Load pseudo-labels from a CSV file."""
+        self.pseudo_labels = load_pseudo_labels_csv(
+            csv_path,
+            score_threshold=self.pl_score_threshold,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------
     # Setup
@@ -325,9 +345,9 @@ class MTKDTrainerV2:
                 k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
                 for k, v in batch.get("targets", {}).items()
             }
+            image_paths: List[str] = batch.get("image_paths", [])
 
             # === Determine stage ===
-            in_burn_in = epoch < self.burn_up_epochs
             do_target_align = epoch >= self.align_target_start_epoch
             do_source_align = epoch >= self.burn_up_epochs
 
@@ -336,7 +356,7 @@ class MTKDTrainerV2:
             if self.scaler is not None:
                 with torch.amp.autocast("cuda"):
                     loss, loss_dict = self._forward_and_loss(
-                        images, targets, epoch,
+                        images, targets, image_paths, epoch,
                         need_teacher_feat=need_teacher,
                         do_source_align=do_source_align,
                         do_target_align=do_target_align,
@@ -344,7 +364,7 @@ class MTKDTrainerV2:
                     loss = loss / accum
             else:
                 loss, loss_dict = self._forward_and_loss(
-                    images, targets, epoch,
+                    images, targets, image_paths, epoch,
                     need_teacher_feat=need_teacher,
                     do_source_align=do_source_align,
                     do_target_align=do_target_align,
@@ -389,6 +409,7 @@ class MTKDTrainerV2:
         self,
         images: torch.Tensor,
         targets: Dict[str, Any],
+        image_paths: List[str],
         epoch: int,
         need_teacher_feat: bool = False,
         do_source_align: bool = False,
@@ -397,6 +418,10 @@ class MTKDTrainerV2:
         """
         Compute losses following the DINO Teacher pattern.
 
+        1. Convert MTKD targets → YOLO flat-tensor batch.
+        2. Run the student **once** in train mode (``forward_train``).
+        3. Stack detection, alignment, and pseudo-label losses.
+
         Returns:
             total_loss:  Scalar tensor for ``.backward()``.
             loss_dict:   Dict of detached loss values for logging.
@@ -404,19 +429,32 @@ class MTKDTrainerV2:
         loss_dict: Dict[str, float] = {}
         losses: List[torch.Tensor] = []
 
-        # ----- Student forward -----
-        out = self.model(
+        # ---- Convert targets to YOLO batch format ----
+        gt_batch = targets_to_yolo_batch(targets, self.device)
+
+        # ---- Build pseudo-label batch (if stage 3) ----
+        pseudo_batch = None
+        if do_target_align and self.pseudo_labels is not None and image_paths:
+            stems = [Path(p).stem for p in image_paths]
+            pseudo_batch = build_yolo_batch_from_pseudo(
+                self.pseudo_labels, stems, self.device,
+            )
+
+        # ---- Single student forward (train mode) + DINO teacher ----
+        out = self.model.forward_train(
             images,
-            return_teacher_features=need_teacher_feat,
-            return_student_spatial_feat=need_teacher_feat,
+            gt_yolo_batch=gt_batch,
+            compute_dino=need_teacher_feat,
         )
 
-        # ----- Supervised detection loss (placeholder — student's own loss) -----
-        # This is always active; it is the user's responsibility to wire in
-        # the actual detection loss from YOLO or a custom head.
-        det_loss = torch.tensor(0.0, device=self.device)
-        loss_dict["loss_det"] = det_loss.item()
+        # ----- Detection loss (GT supervision) -----
+        det_loss = out["det_loss"]       # already = (box+cls+dfl)*B
+        det_items = out["det_loss_items"]  # detached [box, cls, dfl]
         losses.append(det_loss)
+        loss_dict["loss_det"] = det_loss.item()
+        loss_dict["loss_det_box"] = det_items[0].item()
+        loss_dict["loss_det_cls"] = det_items[1].item()
+        loss_dict["loss_det_dfl"] = det_items[2].item()
 
         # ----- Feature alignment (source) -----
         if do_source_align:
@@ -429,16 +467,31 @@ class MTKDTrainerV2:
                 loss_dict["loss_align"] = align_loss.item()
 
         # ----- Pseudo-label loss (target) -----
-        # (Activated after align_target_start_epoch and if PLs available)
-        if do_target_align and self.pseudo_labels is not None:
-            # In a full implementation the trainer would fetch PLs per image_id,
-            # threshold them, and feed them as GT to the student's detection loss.
-            # Below is a structural placeholder — the actual detection loss wiring
-            # depends on the student architecture (YOLO / Faster-RCNN / etc.).
-            pseudo_loss = torch.tensor(0.0, device=self.device)
-            loss_dict["loss_pseudo"] = pseudo_loss.item()
-            weighted_pseudo = pseudo_loss * self.unsup_loss_weight
+        # Computed separately so we can optionally zero out box regression.
+        # Reuses the same raw_preds from the single student forward pass.
+        if do_target_align and pseudo_batch is not None and pseudo_batch["bboxes"].shape[0] > 0:
+            self.model.student._ensure_criterion()
+            criterion = self.model.student._criterion
+
+            if self.zero_pseudo_box_reg:
+                # Temporarily zero box & DFL gains; keep cls only
+                orig_box = criterion.hyp.box
+                orig_dfl = criterion.hyp.dfl
+                criterion.hyp.box = 0.0
+                criterion.hyp.dfl = 0.0
+                try:
+                    pl_loss, pl_items = criterion(out["raw_preds"], pseudo_batch)
+                finally:
+                    criterion.hyp.box = orig_box
+                    criterion.hyp.dfl = orig_dfl
+            else:
+                pl_loss, pl_items = criterion(out["raw_preds"], pseudo_batch)
+
+            weighted_pseudo = pl_loss * self.unsup_loss_w
             losses.append(weighted_pseudo)
+            loss_dict["loss_pseudo"] = pl_loss.item()
+            loss_dict["loss_pseudo_box"] = pl_items[0].item()
+            loss_dict["loss_pseudo_cls"] = pl_items[1].item()
 
         total_loss = sum(losses)  # type: ignore[arg-type]
         loss_dict["total_loss"] = total_loss.item()
@@ -460,8 +513,11 @@ class MTKDTrainerV2:
                 k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
                 for k, v in batch.get("targets", {}).items()
             }
+            image_paths: List[str] = batch.get("image_paths", [])
+            # Validation uses the eval-mode forward for alignment metrics.
+            # Detection loss is still computed (student in train mode internally).
             _, loss_dict = self._forward_and_loss(
-                images, targets, epoch,
+                images, targets, image_paths, epoch,
                 need_teacher_feat=True, do_source_align=True,
             )
             meters.update(loss_dict, n=images.size(0))
