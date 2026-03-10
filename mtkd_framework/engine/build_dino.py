@@ -33,7 +33,9 @@ import torchvision.transforms as T
 # ---------------------------------------------------------------------------
 # Make dinov3 importable
 # ---------------------------------------------------------------------------
-_DINOV3_ROOT = Path(__file__).resolve().parent.parent / "dinov3-main"
+# engine/build_dino.py sits at  mtkd_framework/engine/build_dino.py
+# We need the workspace root:   .parent (engine) → .parent (mtkd_framework) → .parent (workspace)
+_DINOV3_ROOT = Path(__file__).resolve().parent.parent.parent / "dinov3-main"
 if str(_DINOV3_ROOT) not in sys.path:
     sys.path.insert(0, str(_DINOV3_ROOT))
 
@@ -166,10 +168,15 @@ class DinoFeatureExtractor(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Extract a **spatial** feature map from the frozen DINO encoder.
+        Extract a **spatial** feature map from the DINO encoder.
+
+        Note: ``@torch.no_grad()`` is intentionally **not** used here so
+        that gradients can flow through any injected trainable blocks
+        (e.g. ``PluggableFFTBlock``).  The original encoder parameters
+        already have ``requires_grad=False``, so no extra memory is
+        allocated for their gradients.
 
         Args:
             images: ``[B, 3, H, W]``  (float, value range 0-255 or 0-1).
@@ -183,6 +190,10 @@ class DinoFeatureExtractor(nn.Module):
         # --- BGR → RGB ---
         if self.is_bgr:
             x = x[:, [2, 1, 0], :, :]
+
+        # --- Ensure [0, 255] range (dataset may provide [0, 1]) ---
+        if x.max() <= 1.0:
+            x = x * 255.0
 
         # --- ImageNet normalisation ---
         x = self.preprocessing(x)

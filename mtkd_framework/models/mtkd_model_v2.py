@@ -249,10 +249,14 @@ class MTKDModelV2(nn.Module):
                 # lazy-init align head
                 self._ensure_align_head(spatial.shape[1], spatial.device)
 
-        # ----- Frozen DINO teacher forward -----
+        # ----- DINO teacher forward -----
         if return_teacher_features:
-            with torch.no_grad():
-                dino_feat = self.dino_teacher(images)  # [B, D, H_p, W_p]
+            if self.fft_blocks:
+                # FFT blocks need gradients → run with grad enabled
+                dino_feat = self.dino_teacher(images)
+            else:
+                with torch.no_grad():
+                    dino_feat = self.dino_teacher(images)
             result["dino_features"] = dino_feat
 
         return result
@@ -265,6 +269,7 @@ class MTKDModelV2(nn.Module):
         images: torch.Tensor,
         gt_yolo_batch: Dict[str, torch.Tensor],
         compute_dino: bool = True,
+        teacher_images: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
         Efficient training forward:
@@ -282,6 +287,10 @@ class MTKDModelV2(nn.Module):
             images:         ``[B, 3, H, W]``.
             gt_yolo_batch:  YOLO batch dict (``batch_idx/cls/bboxes``).
             compute_dino:   Whether to forward the frozen DINO teacher.
+            teacher_images: Optional separate images for the DINO teacher
+                            (e.g. un-augmented copies when
+                            ``align_easy_only=True``).  Falls back to
+                            ``images`` when ``None``.
 
         Returns:
             dict with ``raw_preds``, ``det_loss``, ``det_loss_items``,
@@ -299,11 +308,16 @@ class MTKDModelV2(nn.Module):
         if student_spatial is not None:
             self._ensure_align_head(student_spatial.shape[1], student_spatial.device)
 
-        # ---- Frozen DINO teacher ----
+        # ---- DINO teacher ----
         dino_feat: Optional[torch.Tensor] = None
         if compute_dino:
-            with torch.no_grad():
-                dino_feat = self.dino_teacher(images)  # [B, D, H_p, W_p]
+            dino_input = teacher_images if teacher_images is not None else images
+            if self.fft_blocks:
+                # FFT blocks need gradients → run with grad enabled
+                dino_feat = self.dino_teacher(dino_input)
+            else:
+                with torch.no_grad():
+                    dino_feat = self.dino_teacher(dino_input)  # [B, D, H_p, W_p]
 
         return {
             "raw_preds": raw_preds,

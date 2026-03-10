@@ -8,7 +8,9 @@ This module provides:
 
 from __future__ import annotations
 
+import copy
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Literal
 
 import torch
@@ -26,10 +28,17 @@ def _decode_ultralytics_output(
     if isinstance(output, tuple):
         if len(output) >= 2 and isinstance(output[1], list):
             return output[0], output[1]
+        # ultralytics >=8.4: (decoded_pred, extra_dict)
+        if (len(output) >= 2
+                and isinstance(output[0], torch.Tensor)
+                and output[0].ndim == 3):
+            return output[0], None
         if len(output) == 1 and isinstance(output[0], list):
             return None, output[0]
     if isinstance(output, list):
         return None, output
+    if isinstance(output, torch.Tensor) and output.ndim == 3:
+        return output, None
     return None, None
 
 
@@ -217,20 +226,20 @@ class YOLOStudentDetector(nn.Module):
         if hasattr(self, "_criterion") and self._criterion is not None:
             return
         # v8DetectionLoss reads model.args for hyp (box/cls/dfl gains).
-        # Ensure args exist even when loading weights for inference only.
-        if not hasattr(self.det_model, "args") or self.det_model.args is None:
+        # In ultralytics >=8.4, model.args is a plain dict missing box/cls/dfl.
+        # Replace it with a full IterableSimpleNamespace from get_cfg().
+        try:
+            from ultralytics.cfg import get_cfg
+            cfg = get_cfg()  # IterableSimpleNamespace with all defaults
+            # Merge any existing model-specific args
+            existing = getattr(self.det_model, "args", None) or {}
+            if isinstance(existing, dict):
+                for k, v in existing.items():
+                    setattr(cfg, k, v)
+            self.det_model.args = cfg
+        except ImportError:
             from types import SimpleNamespace
-
             self.det_model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
-        elif isinstance(self.det_model.args, dict):
-            from types import SimpleNamespace
-
-            raw = self.det_model.args
-            self.det_model.args = SimpleNamespace(
-                box=raw.get("box", 7.5),
-                cls=raw.get("cls", 0.5),
-                dfl=raw.get("dfl", 1.5),
-            )
         self._criterion = self.det_model.init_criterion()
 
     def forward_train_raw(
@@ -286,11 +295,16 @@ class YOLOStudentDetector(nn.Module):
                         ``bboxes`` ``[N, 4]``  (normalised cxcywh).
 
         Returns:
-            loss:       Scalar (= ``(box + cls + dfl) * batch_size``).
+            loss:       Scalar (= ``sum(box + cls + dfl) * batch_size``).
             loss_items: Detached ``[box, cls, dfl]`` for logging.
         """
         self._ensure_criterion()
-        return self._criterion(raw_preds, yolo_batch)
+        loss, loss_items = self._criterion(raw_preds, yolo_batch)
+        # ultralytics >=8.4 returns loss as [box, cls, dfl] (3 elements);
+        # sum to get the scalar total.
+        if loss.ndim > 0 and loss.numel() > 1:
+            loss = loss.sum()
+        return loss, loss_items
 
     def get_loss_hyp(self, key: str) -> float:
         """Read a loss hyperparameter (e.g. ``'box'``, ``'cls'``, ``'dfl'``)."""
@@ -305,6 +319,78 @@ class YOLOStudentDetector(nn.Module):
             pred, image_h, image_w, num_classes=self.num_classes
         )
         return {"boxes": boxes, "scores": scores, "labels": labels}
+
+    def export_ultralytics_pt(
+        self,
+        save_path: str,
+        num_classes: int = 1,
+        class_names: Optional[Dict[int, str]] = None,
+        epoch: int = -1,
+        best_fitness: Optional[float] = None,
+    ) -> str:
+        """
+        Export the trained YOLO student as a standard ultralytics ``.pt`` file.
+
+        The exported file can be loaded directly with:
+            ``from ultralytics import YOLO; model = YOLO('best.pt')``
+
+        Then used for inference:
+            ``results = model.predict(source='images/', conf=0.25)``
+
+        Args:
+            save_path: Output ``.pt`` path.
+            num_classes: Number of classes in the detection head.
+            class_names: Optional mapping ``{0: 'stomata', ...}``.
+            epoch: Training epoch to record.
+            best_fitness: Best fitness to record.
+
+        Returns:
+            The save_path.
+        """
+        if class_names is None:
+            class_names = {i: f"class_{i}" for i in range(num_classes)}
+
+        # Build a clean copy by creating a fresh model and loading state_dict.
+        # This avoids pickling issues with forward hooks.
+        from ultralytics.nn.tasks import DetectionModel as _DM
+
+        yaml_cfg = getattr(self.det_model, "yaml", None)
+        if yaml_cfg is None:
+            raise RuntimeError("det_model has no .yaml attribute — cannot export")
+
+        clean_model = _DM(cfg=yaml_cfg, nc=num_classes, verbose=False)
+        # Load current weights (strict=False to tolerate head shape changes when nc differs)
+        clean_model.load_state_dict(self.det_model.state_dict(), strict=False)
+        clean_model = clean_model.cpu().half()
+        clean_model.names = class_names
+        clean_model.nc = num_classes
+
+        if hasattr(clean_model, "criterion"):
+            clean_model.criterion = None
+
+        ckpt = {
+            "epoch": epoch,
+            "best_fitness": best_fitness,
+            "model": clean_model,
+            "ema": None,
+            "updates": None,
+            "optimizer": None,
+            "train_args": {
+                "task": "detect",
+                "model": "yolo11s.yaml",
+                "data": "stomata.yaml",
+                "imgsz": 640,
+            },
+            "train_metrics": {},
+            "train_results": None,
+            "date": datetime.now().isoformat(),
+            "version": "8.4.19",
+            "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+        }
+
+        torch.save(ckpt, save_path)
+        return save_path
 
 
 class YOLODetectionTeacher(nn.Module):

@@ -256,7 +256,7 @@ class PluggableFFTBlock(nn.Module):
             hidden_dim=hidden_dim,
             num_freq_bins=num_freq_bins,
         )
-        self.grid_generator = _PeriodicGridGenerator(max_height=32)
+        self.grid_generator = _PeriodicGridGenerator(max_height=64)
 
         # additive needs a channel projection
         if modulation_mode == "additive":
@@ -432,6 +432,12 @@ def inject_fft_blocks(
             init_gate=init_gate,
             modulation_mode=modulation_mode,
         )
+        # Move to the same device as existing blocks
+        try:
+            existing_device = next(blocks.parameters()).device
+            fft_blk = fft_blk.to(existing_device)
+        except StopIteration:
+            pass  # no existing parameters — stay on CPU
         # insert right after the requested position
         insert_idx = pos + 1
         blocks.insert(insert_idx, fft_blk)

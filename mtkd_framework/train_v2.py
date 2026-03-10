@@ -135,6 +135,13 @@ def get_default_config_v2() -> Dict[str, Any]:
             "feature_align_loss_weight_target": 1.0,
             "unsup_loss_weight": 4.0,
             "zero_pseudo_box_reg": True,       # zero out pseudo bbox regression loss
+            # ALIGN_EASY_ONLY — When True, the DINO teacher receives *only*
+            # the original (non-augmented) images for alignment, preventing
+            # augmentation artefacts from polluting the teacher signal.
+            # Requires the dataset to supply ``batch["images_weak"]`` (a
+            # second, unaugmented copy).  If False or the key is absent,
+            # the same augmented images are sent to both student and teacher.
+            "align_easy_only": False,
         },
         # ---- pseudo labels ----
         "pseudo_labels": {
@@ -246,6 +253,7 @@ class MTKDTrainerV2:
         self.feature_align_w_target = tc.get("feature_align_loss_weight_target", 1.0)
         self.unsup_loss_w = tc.get("unsup_loss_weight", 4.0)
         self.zero_pseudo_box_reg = tc.get("zero_pseudo_box_reg", True)
+        self.align_easy_only = tc.get("align_easy_only", False)
 
         # ---- pseudo labels ----
         self.pseudo_labels: Optional[Dict] = None
@@ -347,6 +355,11 @@ class MTKDTrainerV2:
             }
             image_paths: List[str] = batch.get("image_paths", [])
 
+            # ALIGN_EASY_ONLY: stash un-augmented images for the teacher
+            self._current_images_weak = None
+            if self.align_easy_only and "images_weak" in batch:
+                self._current_images_weak = batch["images_weak"].to(self.device)
+
             # === Determine stage ===
             do_target_align = epoch >= self.align_target_start_epoch
             do_source_align = epoch >= self.burn_up_epochs
@@ -441,10 +454,20 @@ class MTKDTrainerV2:
             )
 
         # ---- Single student forward (train mode) + DINO teacher ----
+        # ALIGN_EASY_ONLY: feed un-augmented images to the DINO teacher so
+        # that alignment targets are free of augmentation artefacts.  The
+        # dataset must supply ``batch["images_weak"]`` for this to work.
+        teacher_images = images
+        if self.align_easy_only:
+            # images_weak is injected by train_epoch when available
+            if hasattr(self, "_current_images_weak") and self._current_images_weak is not None:
+                teacher_images = self._current_images_weak
+
         out = self.model.forward_train(
             images,
             gt_yolo_batch=gt_batch,
             compute_dino=need_teacher_feat,
+            teacher_images=teacher_images if need_teacher_feat else None,
         )
 
         # ----- Add align head params to optimizer if just lazily created -----
@@ -475,6 +498,27 @@ class MTKDTrainerV2:
                 losses.append(weighted)
                 loss_dict["loss_align"] = align_loss.item()
 
+        # ----- Target feature alignment (stage 3) -----
+        # Mirrors DINO Teacher's ``loss_align_target``.  In DINO_Teacher this
+        # is computed on *unlabeled target-domain* images with a separate
+        # weight.  In MTKD (single-dataset), the same images serve both
+        # roles, so we add a second weighted alignment signal in stage 3 to
+        # guide the student backbone toward the DINO teacher space on the
+        # target distribution.
+        if do_target_align and do_source_align:
+            student_feat = out.get("student_spatial_feat")
+            dino_feat = out.get("dino_features")
+            if student_feat is not None and dino_feat is not None:
+                # Reuse align_loss if already computed, else recompute
+                if "loss_align" not in loss_dict:
+                    align_loss_target = self.model.compute_align_loss(
+                        student_feat, dino_feat)
+                else:
+                    align_loss_target = align_loss  # same data → same value
+                weighted_target = align_loss_target * self.feature_align_w_target
+                losses.append(weighted_target)
+                loss_dict["loss_align_target"] = align_loss_target.item()
+
         # ----- Pseudo-label loss (target) -----
         # Computed separately so we can optionally zero out box regression.
         # Reuses the same raw_preds from the single student forward pass.
@@ -495,6 +539,10 @@ class MTKDTrainerV2:
                     criterion.hyp.dfl = orig_dfl
             else:
                 pl_loss, pl_items = criterion(out["raw_preds"], pseudo_batch)
+
+            # ultralytics >=8.4 returns loss as [box, cls, dfl]; sum to scalar
+            if pl_loss.ndim > 0 and pl_loss.numel() > 1:
+                pl_loss = pl_loss.sum()
 
             weighted_pseudo = pl_loss * self.unsup_loss_w
             losses.append(weighted_pseudo)
