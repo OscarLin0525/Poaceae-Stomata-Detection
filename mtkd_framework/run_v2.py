@@ -100,6 +100,14 @@ def parse_args() -> argparse.Namespace:
                     help="Target feature alignment loss weight (stage 3)")
     g4.add_argument("--unsup-loss-weight", type=float, default=4.0,
                     help="Pseudo-label (unsupervised) loss multiplier")
+    g4.add_argument("--separation-loss-weight", type=float, default=0.0,
+                    help="Valley separation loss weight (encourages spatial gaps between stomata)")
+    g4.add_argument("--separation-target-layer", type=int, default=10,
+                    help="DINO layer to extract features for separation loss")
+    g4.add_argument("--separation-sample-points", type=int, default=5,
+                    help="Number of points to sample along connecting lines")
+    g4.add_argument("--separation-valley-margin", type=float, default=0.2,
+                    help="Minimum valley depth factor for separation loss")
     g4.add_argument("--zero-pseudo-box-reg", action="store_true", default=True,
                     help="Zero out pseudo bbox/dfl loss (cls only)")
     g4.add_argument("--no-zero-pseudo-box-reg", dest="zero_pseudo_box_reg",
@@ -189,6 +197,10 @@ def args_to_config(args: argparse.Namespace) -> dict:
     t["feature_align_loss_weight"] = args.feature_align_weight
     t["feature_align_loss_weight_target"] = args.feature_align_weight_target
     t["unsup_loss_weight"] = args.unsup_loss_weight
+    t["separation_loss_weight"] = args.separation_loss_weight
+    t["separation_target_layer"] = args.separation_target_layer
+    t["separation_sample_points"] = args.separation_sample_points
+    t["separation_valley_margin"] = args.separation_valley_margin
     t["zero_pseudo_box_reg"] = args.zero_pseudo_box_reg
     t["align_easy_only"] = args.align_easy_only
 

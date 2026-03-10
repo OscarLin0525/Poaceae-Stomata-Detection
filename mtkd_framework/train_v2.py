@@ -50,6 +50,7 @@ from .engine.pseudo_labels import (
     build_yolo_batch_from_pseudo,
     targets_to_yolo_batch,
 )
+from .losses.separation import ValleySeparationLoss
 from .utils import (
     AverageMeterDict,
     EarlyStopping,
@@ -134,6 +135,10 @@ def get_default_config_v2() -> Dict[str, Any]:
             "feature_align_loss_weight": 1.0,
             "feature_align_loss_weight_target": 1.0,
             "unsup_loss_weight": 4.0,
+            "separation_loss_weight": 0.0,     # valley separation loss (disabled by default)
+            "separation_sample_points": 5,     # points to sample along connecting lines
+            "separation_valley_margin": 0.2,   # minimum valley depth factor
+            "separation_target_layer": 10,     # which DINO layer to extract features from
             "zero_pseudo_box_reg": True,       # zero out pseudo bbox regression loss
             # ALIGN_EASY_ONLY — When True, the DINO teacher receives *only*
             # the original (non-augmented) images for alignment, preventing
@@ -252,8 +257,20 @@ class MTKDTrainerV2:
         self.feature_align_w = tc.get("feature_align_loss_weight", 1.0)
         self.feature_align_w_target = tc.get("feature_align_loss_weight_target", 1.0)
         self.unsup_loss_w = tc.get("unsup_loss_weight", 4.0)
+        self.separation_loss_w = tc.get("separation_loss_weight", 0.0)  # disabled by default
         self.zero_pseudo_box_reg = tc.get("zero_pseudo_box_reg", True)
         self.align_easy_only = tc.get("align_easy_only", False)
+        
+        # ---- separation loss ----
+        self.separation_loss_fn = None
+        if self.separation_loss_w > 0:
+            self.separation_loss_fn = ValleySeparationLoss(
+                sample_points=tc.get("separation_sample_points", 5),
+                valley_margin=tc.get("separation_valley_margin", 0.2),
+            )
+            self.logger.info(f"Separation loss enabled (weight={self.separation_loss_w})")
+            # Target DINO layer for separation loss
+            self.separation_target_layer = tc.get("separation_target_layer", 10)
 
         # ---- pseudo labels ----
         self.pseudo_labels: Optional[Dict] = None
@@ -550,10 +567,147 @@ class MTKDTrainerV2:
             loss_dict["loss_pseudo_box"] = pl_items[0].item()
             loss_dict["loss_pseudo_cls"] = pl_items[1].item()
 
+        # ----- Separation loss -----
+        # Encourages valleys between adjacent GT stomata in feature space
+        if self.separation_loss_fn is not None and gt_batch is not None:
+            # Extract layer features from DINO teacher
+            layer_features = self._extract_dino_layer_features(
+                teacher_images, self.separation_target_layer
+            )
+            # Parse GT centers from YOLO batch
+            gt_centers_list = self._extract_gt_centers_from_batch(
+                gt_batch, layer_features.shape[1:3]
+            )
+            # Compute separation loss
+            if layer_features is not None and len(gt_centers_list) > 0:
+                sep_loss = self.separation_loss_fn(layer_features, gt_centers_list)
+                weighted_sep = sep_loss * self.separation_loss_w
+                losses.append(weighted_sep)
+                loss_dict["loss_separation"] = sep_loss.item()
+        
         total_loss = sum(losses)  # type: ignore[arg-type]
         loss_dict["total_loss"] = total_loss.item()
 
         return total_loss, loss_dict
+
+    # ------------------------------------------------------------------
+    # Separation Loss Helpers
+    # ------------------------------------------------------------------
+    def _extract_dino_layer_features(
+        self,
+        images: torch.Tensor,
+        layer_idx: int
+    ) -> Optional[torch.Tensor]:
+        """
+        Extract features from a specific DINO layer using a forward hook.
+        
+        Args:
+            images: [B, 3, H, W] input images
+            layer_idx: Which layer block to extract (e.g., 10 for layer 10)
+        
+        Returns:
+            features: [B, h, w, C] spatial features from the specified layer
+                     where h, w = H//patch_size, W//patch_size
+        """
+        if not hasattr(self.model, 'dino_teacher') or self.model.dino_teacher is None:
+            return None
+        
+        dino_model = self.model.dino_teacher.model
+        if not hasattr(dino_model, 'blocks') or layer_idx >= len(dino_model.blocks):
+            return None
+        
+        extracted_features = {}
+        
+        def hook_fn(module, input, output):
+            # output is [B, N_tokens+1, C] where N_tokens = (H/patch_size) * (W/patch_size)
+            extracted_features['output'] = output
+        
+        # Register hook
+        handle = dino_model.blocks[layer_idx].register_forward_hook(hook_fn)
+        
+        try:
+            # Run forward pass
+            with torch.no_grad():
+                _ = dino_model(images)
+            
+            # Extract features
+            if 'output' not in extracted_features:
+                return None
+            
+            feat = extracted_features['output']  # [B, N+1, C]
+            B, N_plus_1, C = feat.shape
+            
+            # Remove CLS token (first token)
+            spatial_tokens = feat[:, 1:, :]  # [B, N, C]
+            
+            # Reshape to spatial grid
+            N = N_plus_1 - 1
+            h = w = int(N ** 0.5)
+            assert h * w == N, f"Non-square token count: {N}"
+            
+            spatial_features = spatial_tokens.reshape(B, h, w, C)  # [B, h, w, C]
+            
+            return spatial_features
+        
+        finally:
+            handle.remove()
+    
+    def _extract_gt_centers_from_batch(
+        self,
+        yolo_batch: Dict[str, torch.Tensor],
+        spatial_shape: Tuple[int, int]
+    ) -> List[torch.Tensor]:
+        """
+        Extract GT center coordinates from YOLO batch format.
+        
+        Args:
+            yolo_batch: Dict with keys 'bboxes' [N, 5 or 6], 'cls' [N], 'batch_idx' [N]
+                       bboxes format: [batch_idx, class, cx, cy, w, h] (normalized 0-1)
+            spatial_shape: (h, w) - spatial dimensions of the feature map
+        
+        Returns:
+            List of [N_i, 2] tensors containing (row, col) for each image in batch
+        """
+        if yolo_batch is None or 'bboxes' not in yolo_batch:
+            return []
+        
+        bboxes = yolo_batch['bboxes']  # [N, 5 or 6]
+        if bboxes.shape[0] == 0:
+            return []
+        
+        # Parse batch indices and centers
+        # Format: [batch_idx, cls, cx, cy, w, h] or [cls, cx, cy, w, h]
+        if bboxes.shape[1] == 6:
+            batch_indices = bboxes[:, 0].long()  # [N]
+            centers_norm = bboxes[:, 2:4]  # [N, 2] (cx, cy) in [0, 1]
+        else:
+            # Need to use batch_idx from yolo_batch
+            batch_indices = yolo_batch.get('batch_idx', torch.zeros(bboxes.shape[0], dtype=torch.long))
+            centers_norm = bboxes[:, 1:3]  # [N, 2]
+        
+        h, w = spatial_shape
+        
+        # Convert normalized centers to spatial coordinates
+        centers_spatial = centers_norm.clone()
+        centers_spatial[:, 0] = centers_norm[:, 1] * h  # cy -> row
+        centers_spatial[:, 1] = centers_norm[:, 0] * w  # cx -> col
+        centers_spatial = centers_spatial.round().long()
+        
+        # Clamp to valid range
+        centers_spatial[:, 0] = centers_spatial[:, 0].clamp(0, h - 1)
+        centers_spatial[:, 1] = centers_spatial[:, 1].clamp(0, w - 1)
+        
+        # Group by batch index
+        B = batch_indices.max().item() + 1
+        centers_list = []
+        for b in range(B):
+            mask = batch_indices == b
+            if mask.sum() > 0:
+                centers_list.append(centers_spatial[mask])  # [N_b, 2]
+            else:
+                centers_list.append(torch.empty((0, 2), dtype=torch.long, device=centers_spatial.device))
+        
+        return centers_list
 
     # ------------------------------------------------------------------
     # Validate
