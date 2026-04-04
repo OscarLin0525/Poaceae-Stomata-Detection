@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
@@ -23,23 +23,35 @@ logger = logging.getLogger(__name__)
 
 def _decode_ultralytics_output(
     output: object,
-) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]]]:
-    """Normalize Ultralytics forward output to (decoded_pred, raw_levels)."""
+) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Dict[str, Any]]:
+    """Normalize Ultralytics forward output to (decoded_pred, raw_levels, extra)."""
+    extra: Dict[str, Any] = {}
     if isinstance(output, tuple):
         if len(output) >= 2 and isinstance(output[1], list):
-            return output[0], output[1]
+            return output[0], output[1], extra
+        if len(output) >= 2 and isinstance(output[1], dict):
+            extra = output[1]
+            feats = extra.get("feats")
+            raw_levels = feats if isinstance(feats, list) else None
+            decoded = output[0] if isinstance(output[0], torch.Tensor) else None
+            return decoded, raw_levels, extra
         # ultralytics >=8.4: (decoded_pred, extra_dict)
         if (len(output) >= 2
                 and isinstance(output[0], torch.Tensor)
                 and output[0].ndim == 3):
-            return output[0], None
+            return output[0], None, extra
         if len(output) == 1 and isinstance(output[0], list):
-            return None, output[0]
+            return None, output[0], extra
     if isinstance(output, list):
-        return None, output
+        return None, output, extra
+    if isinstance(output, dict):
+        extra = output
+        feats = extra.get("feats")
+        raw_levels = feats if isinstance(feats, list) else None
+        return None, raw_levels, extra
     if isinstance(output, torch.Tensor) and output.ndim == 3:
-        return output, None
-    return None, None
+        return output, None, extra
+    return None, None, extra
 
 
 def _pred_to_boxes_and_logits(
@@ -47,7 +59,8 @@ def _pred_to_boxes_and_logits(
     image_h: int,
     image_w: int,
     num_classes: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    task: str = "detect",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Convert decoded YOLO prediction [B, 4+nc, N] to MTKD format.
 
@@ -60,22 +73,28 @@ def _pred_to_boxes_and_logits(
     if pred.dim() != 3 or pred.shape[1] < 5:
         raise ValueError(f"Unexpected decoded prediction shape: {tuple(pred.shape)}")
 
-    # Ultralytics decoded boxes are in pixel cxcywh.
-    boxes = pred[:, :4, :].permute(0, 2, 1).contiguous()
+    task = task.lower()
+    is_obb = task == "obb"
+
+    # Ultralytics decoded boxes are in pixel cxcywh (and +angle for OBB).
+    box_dim = 5 if is_obb else 4
+    boxes_all = pred[:, :box_dim, :].permute(0, 2, 1).contiguous()
+    boxes = boxes_all[..., :4]
     scale = boxes.new_tensor([image_w, image_h, image_w, image_h]).view(1, 1, 4)
     boxes = (boxes / scale).clamp(0.0, 1.0)
+    angles = boxes_all[..., 4:5] if is_obb else None
 
-    # Decoded cls scores are probabilities in [0, 1].
-    cls_prob = pred[:, 4:, :].permute(0, 2, 1).contiguous().clamp(1e-6, 1 - 1e-6)
-    if num_classes is not None:
-        if cls_prob.shape[-1] >= num_classes:
-            cls_prob = cls_prob[..., :num_classes]
+    cls_start = box_dim
+    if num_classes is None:
+        # OBB decoded pred can contain one extra angle channel at the tail.
+        tail = pred.shape[1] - cls_start
+        if is_obb and tail > 1:
+            num_classes = tail - 1
         else:
-            pad = cls_prob.new_full(
-                (cls_prob.shape[0], cls_prob.shape[1], num_classes - cls_prob.shape[-1]),
-                1e-6,
-            )
-            cls_prob = torch.cat([cls_prob, pad], dim=-1)
+            num_classes = tail
+
+    cls_prob = pred[:, cls_start:cls_start + num_classes, :]
+    cls_prob = cls_prob.permute(0, 2, 1).contiguous().clamp(1e-6, 1 - 1e-6)
     cls_logits = torch.log(cls_prob / (1.0 - cls_prob))
 
     scores, labels = cls_prob.max(dim=-1)
@@ -83,7 +102,7 @@ def _pred_to_boxes_and_logits(
     bg_logit = torch.log(bg_prob / (1.0 - bg_prob))
     logits = torch.cat([cls_logits, bg_logit], dim=-1)
 
-    return boxes, logits, scores, labels
+    return boxes, logits, scores, labels, angles
 
 
 class YOLOStudentDetector(nn.Module):
@@ -111,6 +130,8 @@ class YOLOStudentDetector(nn.Module):
 
         yolo_obj = YOLO(weights)
         self.det_model = yolo_obj.model
+        self.task = str(getattr(yolo_obj, "task", "detect")).lower()
+        self.box_dim = 5 if self.task == "obb" else 4
         # Ultralytics checkpoints may load with frozen params; ensure student is trainable.
         for p in self.det_model.parameters():
             p.requires_grad = True
@@ -131,9 +152,16 @@ class YOLOStudentDetector(nn.Module):
     def _register_detect_prehook(self) -> None:
         detect_module = None
         if hasattr(self.det_model, "model") and len(self.det_model.model) > 0:
-            # Usually the last module is Detect.
+            # Usually the last module is Detect (or OBB, which subclasses Detect).
+            try:
+                from ultralytics.nn.modules.head import Detect
+            except Exception:  # pragma: no cover - compatibility fallback
+                Detect = None
             for module in reversed(self.det_model.model):
-                if module.__class__.__name__.lower() == "detect":
+                if Detect is not None and isinstance(module, Detect):
+                    detect_module = module
+                    break
+                if module.__class__.__name__.lower() in {"detect", "obb"}:
                     detect_module = module
                     break
         if detect_module is None:
@@ -159,7 +187,10 @@ class YOLOStudentDetector(nn.Module):
                 adapter_type=self.adapter_type,
             ).to(device)
 
-    def _forward_decoded(self, images: torch.Tensor) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
+    def _forward_decoded(
+        self,
+        images: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]], Dict[str, Any]]:
         """
         Run YOLO in eval forward format to get decoded predictions with gradients enabled.
         """
@@ -171,11 +202,11 @@ class YOLOStudentDetector(nn.Module):
         if was_training:
             self.det_model.train()
 
-        pred, raw_levels = _decode_ultralytics_output(output)
+        pred, raw_levels, extra = _decode_ultralytics_output(output)
         if pred is None:
             raise RuntimeError("YOLO output does not contain decoded predictions in eval forward path")
 
-        return pred, raw_levels, self._last_neck_features
+        return pred, raw_levels, self._last_neck_features, extra
 
     def forward(
         self,
@@ -183,11 +214,11 @@ class YOLOStudentDetector(nn.Module):
         return_features: bool = False,
         return_adapted_features: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        pred, raw_levels, neck_features = self._forward_decoded(images)
+        pred, raw_levels, neck_features, extra = self._forward_decoded(images)
 
         image_h, image_w = images.shape[-2:]
-        boxes, logits, scores, labels = _pred_to_boxes_and_logits(
-            pred, image_h, image_w, num_classes=self.num_classes
+        boxes, logits, scores, labels, angles = _pred_to_boxes_and_logits(
+            pred, image_h, image_w, num_classes=self.num_classes, task=self.task
         )
 
         outputs: Dict[str, torch.Tensor] = {
@@ -201,6 +232,8 @@ class YOLOStudentDetector(nn.Module):
         elif raw_levels is not None and len(raw_levels) >= 3:
             # Fallback: use detect outputs when neck input is unavailable.
             pyramid = raw_levels[:3]
+        elif isinstance(extra.get("feats"), list) and len(extra["feats"]) >= 3:
+            pyramid = extra["feats"][:3]
 
         if return_features and pyramid is not None:
             outputs["p3_features"] = pyramid[0]
@@ -216,6 +249,8 @@ class YOLOStudentDetector(nn.Module):
         # Keep score/label for optional debugging.
         outputs["scores"] = scores
         outputs["labels"] = labels
+        if angles is not None:
+            outputs["angles"] = angles
         return outputs
 
     # ------------------------------------------------------------------
@@ -275,6 +310,12 @@ class YOLOStudentDetector(nn.Module):
             features["p3_features"] = self._last_neck_features[0]
             features["p4_features"] = self._last_neck_features[1]
             features["p5_features"] = self._last_neck_features[2]
+        elif isinstance(raw_preds, dict) and isinstance(raw_preds.get("feats"), list):
+            feats = raw_preds["feats"]
+            if len(feats) >= 3:
+                features["p3_features"] = feats[0]
+                features["p4_features"] = feats[1]
+                features["p5_features"] = feats[2]
 
         return raw_preds, features
 
@@ -292,7 +333,7 @@ class YOLOStudentDetector(nn.Module):
         Args:
             raw_preds:  Output of :meth:`forward_train_raw`.
             yolo_batch: Dict with ``batch_idx`` ``[N]``, ``cls`` ``[N, 1]``,
-                        ``bboxes`` ``[N, 4]``  (normalised cxcywh).
+                        ``bboxes`` ``[N, 4 or 5]``  (normalised cxcywh[+angle]).
 
         Returns:
             loss:       Scalar (= ``sum(box + cls + dfl) * batch_size``).
@@ -313,11 +354,13 @@ class YOLOStudentDetector(nn.Module):
 
     @torch.no_grad()
     def get_detection_output(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        pred, _, _ = self._forward_decoded(images)
+        pred, _, _, _ = self._forward_decoded(images)
         image_h, image_w = images.shape[-2:]
-        boxes, _, scores, labels = _pred_to_boxes_and_logits(
-            pred, image_h, image_w, num_classes=self.num_classes
+        boxes, _, scores, labels, angles = _pred_to_boxes_and_logits(
+            pred, image_h, image_w, num_classes=self.num_classes, task=self.task
         )
+        if angles is not None:
+            boxes = torch.cat([boxes, angles], dim=-1)
         return {"boxes": boxes, "scores": scores, "labels": labels}
 
     def export_ultralytics_pt(
@@ -352,15 +395,42 @@ class YOLOStudentDetector(nn.Module):
 
         # Build a clean copy by creating a fresh model and loading state_dict.
         # This avoids pickling issues with forward hooks.
-        from ultralytics.nn.tasks import DetectionModel as _DM
+        from ultralytics.nn.tasks import DetectionModel as _DM, OBBModel as _OM
 
         yaml_cfg = getattr(self.det_model, "yaml", None)
         if yaml_cfg is None:
             raise RuntimeError("det_model has no .yaml attribute — cannot export")
 
-        clean_model = _DM(cfg=yaml_cfg, nc=num_classes, verbose=False)
-        # Load current weights (strict=False to tolerate head shape changes when nc differs)
-        clean_model.load_state_dict(self.det_model.state_dict(), strict=False)
+        if self.task == "obb":
+            clean_model = _OM(cfg=yaml_cfg, nc=num_classes, verbose=False)
+        else:
+            clean_model = _DM(cfg=yaml_cfg, nc=num_classes, verbose=False)
+        # Load compatible tensors and partially map class heads when nc differs.
+        # PyTorch strict=False still errors on same-key shape mismatch, so we
+        # build a filtered/mapped dict explicitly.
+        src_state = self.det_model.state_dict()
+        dst_state = clean_model.state_dict()
+        compatible_state = {}
+        for k, src_v in src_state.items():
+            if k not in dst_state:
+                continue
+            dst_v = dst_state[k]
+            if dst_v.shape == src_v.shape:
+                compatible_state[k] = src_v
+                continue
+
+            # Handle reduced class heads, e.g. src [80, C, 1, 1] -> dst [3, C, 1, 1]
+            # or src [80] -> dst [3]. Copy leading channels/classes.
+            if (
+                src_v.ndim == dst_v.ndim
+                and src_v.shape[0] >= dst_v.shape[0]
+                and list(src_v.shape[1:]) == list(dst_v.shape[1:])
+            ):
+                mapped = dst_v.clone()
+                mapped[: dst_v.shape[0]] = src_v[: dst_v.shape[0]]
+                compatible_state[k] = mapped
+
+        clean_model.load_state_dict(compatible_state, strict=False)
         clean_model = clean_model.cpu().half()
         clean_model.names = class_names
         clean_model.nc = num_classes
@@ -376,7 +446,7 @@ class YOLOStudentDetector(nn.Module):
             "updates": None,
             "optimizer": None,
             "train_args": {
-                "task": "detect",
+                "task": self.task,
                 "model": "yolo11s.yaml",
                 "data": "stomata.yaml",
                 "imgsz": 640,
@@ -413,6 +483,8 @@ class YOLODetectionTeacher(nn.Module):
 
         yolo_obj = YOLO(weights)
         self.det_model = yolo_obj.model
+        self.task = str(getattr(yolo_obj, "task", "detect")).lower()
+        self.box_dim = 5 if self.task == "obb" else 4
         self.score_threshold = score_threshold
         self.max_detections = max_detections
         self.num_classes = num_classes
@@ -429,14 +501,16 @@ class YOLODetectionTeacher(nn.Module):
         if was_training:
             self.det_model.train()
 
-        pred, _ = _decode_ultralytics_output(output)
+        pred, _, _ = _decode_ultralytics_output(output)
         if pred is None:
             raise RuntimeError("YOLO teacher output does not contain decoded predictions")
 
         image_h, image_w = images.shape[-2:]
-        boxes, _, scores, labels = _pred_to_boxes_and_logits(
-            pred, image_h, image_w, num_classes=self.num_classes
+        boxes, _, scores, labels, angles = _pred_to_boxes_and_logits(
+            pred, image_h, image_w, num_classes=self.num_classes, task=self.task
         )
+        if angles is not None:
+            boxes = torch.cat([boxes, angles], dim=-1)
 
         # Apply per-image threshold and top-k, then pad to batch tensor.
         batch_boxes: List[torch.Tensor] = []
@@ -464,9 +538,10 @@ class YOLODetectionTeacher(nn.Module):
             batch_scores.append(b_scores)
             batch_labels.append(b_labels)
 
-        padded_boxes = boxes.new_zeros((boxes.shape[0], max_keep, 4))
+        padded_boxes = boxes.new_zeros((boxes.shape[0], max_keep, boxes.shape[-1]))
         padded_scores = scores.new_full((scores.shape[0], max_keep), -1.0)
         padded_labels = labels.new_zeros((labels.shape[0], max_keep), dtype=torch.long)
+        valid_mask = torch.zeros((labels.shape[0], max_keep), dtype=torch.bool, device=labels.device)
 
         for b, (b_boxes, b_scores, b_labels) in enumerate(zip(batch_boxes, batch_scores, batch_labels)):
             n = b_scores.numel()
@@ -475,9 +550,11 @@ class YOLODetectionTeacher(nn.Module):
             padded_boxes[b, :n] = b_boxes
             padded_scores[b, :n] = b_scores
             padded_labels[b, :n] = b_labels
+            valid_mask[b, :n] = True
 
         return {
             "boxes": padded_boxes,
             "scores": padded_scores,
             "labels": padded_labels,
+            "valid_mask": valid_mask,
         }

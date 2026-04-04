@@ -13,7 +13,7 @@ between ensemble teachers and student for object detection.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple, Literal, List
+from typing import Any, Optional, Dict, Tuple, Literal, List
 import math
 
 
@@ -166,6 +166,96 @@ def complete_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor
 
     ciou = iou - center_dist / (diag_c + 1e-8) - alpha * v
     return ciou
+
+
+class UltralyticsCriterionAlignmentLoss(nn.Module):
+    """
+    Prediction alignment through Ultralytics' native criterion path.
+
+    Instead of matching teacher/student predictions index-by-index, this loss
+    reuses the same target assignment and loss computation that Ultralytics
+    applies for ground-truth training (TaskAlignedAssigner + box/cls/DFL terms).
+
+    Expected inputs:
+    - ``raw_preds``: student raw outputs from YOLO train forward.
+    - ``pseudo_batch``: YOLO-style targets dict
+      {"batch_idx", "cls", "bboxes"} built from teacher labels.
+    - ``criterion``: student's initialized Ultralytics criterion.
+    """
+
+    def __init__(
+        self,
+        unsup_weight: float = 1.0,
+        zero_box_dfl: bool = False,
+    ):
+        super().__init__()
+        self.unsup_weight = float(unsup_weight)
+        self.zero_box_dfl = bool(zero_box_dfl)
+
+    @staticmethod
+    def _to_scalar_loss(loss: torch.Tensor) -> torch.Tensor:
+        # ultralytics can return vector loss items; training uses their sum.
+        if loss.ndim > 0 and loss.numel() > 1:
+            return loss.sum()
+        return loss
+
+    def _criterion_loss(
+        self,
+        criterion: Any,
+        raw_preds: Any,
+        pseudo_batch: Dict[str, torch.Tensor],
+        zero_box_dfl: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if zero_box_dfl:
+            # Keep cls guidance while disabling pseudo box/DFL regression.
+            orig_box = criterion.hyp.box
+            orig_dfl = criterion.hyp.dfl
+            criterion.hyp.box = 0.0
+            criterion.hyp.dfl = 0.0
+            try:
+                loss, loss_items = criterion(raw_preds, pseudo_batch)
+            finally:
+                criterion.hyp.box = orig_box
+                criterion.hyp.dfl = orig_dfl
+        else:
+            loss, loss_items = criterion(raw_preds, pseudo_batch)
+
+        return self._to_scalar_loss(loss), loss_items
+
+    def forward(
+        self,
+        raw_preds: Any,
+        pseudo_batch: Dict[str, torch.Tensor],
+        criterion: Any,
+        unsup_weight: Optional[float] = None,
+        zero_box_dfl: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        weight = self.unsup_weight if unsup_weight is None else float(unsup_weight)
+        use_zero_box_dfl = self.zero_box_dfl if zero_box_dfl is None else bool(zero_box_dfl)
+
+        pseudo_loss, pseudo_items = self._criterion_loss(
+            criterion=criterion,
+            raw_preds=raw_preds,
+            pseudo_batch=pseudo_batch,
+            zero_box_dfl=use_zero_box_dfl,
+        )
+        weighted = pseudo_loss * weight
+
+        loss_dict: Dict[str, torch.Tensor] = {
+            "loss_pseudo": pseudo_loss.detach(),
+            "loss_pseudo_weighted": weighted.detach(),
+        }
+
+        if isinstance(pseudo_items, torch.Tensor) and pseudo_items.numel() >= 1:
+            loss_dict["loss_pseudo_box"] = pseudo_items[0].detach()
+        if isinstance(pseudo_items, torch.Tensor) and pseudo_items.numel() >= 2:
+            loss_dict["loss_pseudo_cls"] = pseudo_items[1].detach()
+        if isinstance(pseudo_items, torch.Tensor) and pseudo_items.numel() >= 3:
+            loss_dict["loss_pseudo_dfl"] = pseudo_items[2].detach()
+        if isinstance(pseudo_items, torch.Tensor) and pseudo_items.numel() >= 4:
+            loss_dict["loss_pseudo_angle"] = pseudo_items[3].detach()
+
+        return weighted, loss_dict
 
 
 class BoxAlignmentLoss(nn.Module):

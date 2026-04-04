@@ -70,6 +70,41 @@ def obb_to_aabb(coords: np.ndarray) -> np.ndarray:
     return np.stack([cx, cy, w, h], axis=1)
 
 
+def obb_to_xywhr(coords: np.ndarray) -> np.ndarray:
+    """
+    Convert oriented box corners (x1..x4,y1..y4) to (cx, cy, w, h, angle).
+
+    Angle is in radians, normalized to Ultralytics OBB convention.
+    """
+    from ultralytics.utils.ops import xyxyxyxy2xywhr
+
+    xywhr = xyxyxyxy2xywhr(coords)
+    if isinstance(xywhr, torch.Tensor):
+        xywhr = xywhr.detach().cpu().numpy()
+    return np.asarray(xywhr, dtype=np.float32)
+
+
+def horizontal_flip_boxes(bboxes: np.ndarray) -> np.ndarray:
+    """
+    Horizontally flip normalized boxes in ``xywh`` or ``xywhr`` format.
+
+    Args:
+        bboxes: ``[N, 4]`` or ``[N, 5]`` where x-center is normalized in [0, 1].
+
+    Returns:
+        Flipped copy with ``cx -> 1-cx`` and, for rotated boxes, ``angle -> -angle``.
+    """
+    if bboxes.size == 0:
+        return bboxes
+
+    out = np.asarray(bboxes, dtype=np.float32).copy()
+    out[:, 0] = 1.0 - out[:, 0]
+    if out.shape[1] >= 5:
+        # Under horizontal reflection, the orientation sign flips.
+        out[:, 4] = -out[:, 4]
+    return out
+
+
 # ======================================================================
 # Single-file parser
 # ======================================================================
@@ -78,6 +113,7 @@ def parse_yolo_txt(
     txt_path: str,
     score_threshold: float = 0.0,
     convert_obb: bool = True,
+    target_box_format: str = "xywh",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Parse a YOLO-format ``.txt`` label file.
@@ -93,13 +129,20 @@ def parse_yolo_txt(
     9       OBB + conf
     ======  ============================
 
+    Args:
+        target_box_format: ``"xywh"`` (axis-aligned) or ``"xywhr"`` (rotated).
+
     Returns:
         classes:  ``[N]``    int64
-        bboxes:   ``[N, 4]`` float32  ``cx cy w h``
+        bboxes:   ``[N, 4 or 5]`` float32
     """
+    if target_box_format not in {"xywh", "xywhr"}:
+        raise ValueError("target_box_format must be 'xywh' or 'xywhr'")
+
+    out_dim = 5 if target_box_format == "xywhr" else 4
     text = Path(txt_path).read_text().strip()
     if not text:
-        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((0,), dtype=np.int64), np.zeros((0, out_dim), dtype=np.float32)
 
     classes_list: List[int] = []
     bboxes_list: List[List[float]] = []
@@ -118,25 +161,34 @@ def parse_yolo_txt(
             bbox, conf = vals[:4], vals[4]
         elif len(vals) == 8:
             if convert_obb:
-                bbox = obb_to_aabb(np.array(vals).reshape(1, 8))[0].tolist()
+                if target_box_format == "xywhr":
+                    bbox = obb_to_xywhr(np.array(vals, dtype=np.float32).reshape(1, 8))[0].tolist()
+                else:
+                    bbox = obb_to_aabb(np.array(vals, dtype=np.float32).reshape(1, 8))[0].tolist()
             else:
                 continue  # skip if OBB conversion disabled
             conf = 1.0
         elif len(vals) == 9:
             conf = vals[8]
             if convert_obb:
-                bbox = obb_to_aabb(np.array(vals[:8]).reshape(1, 8))[0].tolist()
+                if target_box_format == "xywhr":
+                    bbox = obb_to_xywhr(np.array(vals[:8], dtype=np.float32).reshape(1, 8))[0].tolist()
+                else:
+                    bbox = obb_to_aabb(np.array(vals[:8], dtype=np.float32).reshape(1, 8))[0].tolist()
             else:
                 continue
         else:
             continue
 
+        if target_box_format == "xywhr" and len(bbox) == 4:
+            bbox = bbox + [0.0]
+
         if conf >= score_threshold:
             classes_list.append(cls)
-            bboxes_list.append(bbox[:4])
+            bboxes_list.append(bbox[:out_dim])
 
     if not classes_list:
-        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((0,), dtype=np.int64), np.zeros((0, out_dim), dtype=np.float32)
 
     return (
         np.array(classes_list, dtype=np.int64),
@@ -152,6 +204,7 @@ def load_pseudo_labels_dir(
     label_dir: str,
     score_threshold: float = 0.5,
     convert_obb: bool = True,
+    target_box_format: str = "xywh",
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """
     Load every ``.txt`` file in *label_dir* as pseudo-labels.
@@ -168,7 +221,7 @@ def load_pseudo_labels_dir(
     for txt_file in sorted(label_dir.glob("*.txt")):
         stem = txt_file.stem
         classes, bboxes = parse_yolo_txt(
-            str(txt_file), score_threshold, convert_obb,
+            str(txt_file), score_threshold, convert_obb, target_box_format,
         )
         if len(classes) > 0:
             result[stem] = {"classes": classes, "bboxes": bboxes}
@@ -240,6 +293,7 @@ def build_yolo_batch_from_pseudo(
     pseudo_labels: Dict[str, Dict[str, np.ndarray]],
     image_stems: Sequence[str],
     device: torch.device,
+    horizontal_flip_mask: Optional[Sequence[bool]] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """
     Build a YOLO-compatible batch dict from pseudo-labels that match the
@@ -250,9 +304,11 @@ def build_yolo_batch_from_pseudo(
         image_stems:   List of stems for each image in the batch
                        (same order as the image tensor).
         device:        Target device.
+        horizontal_flip_mask: Optional per-image boolean mask indicating
+                       whether the corresponding student image was mirrored.
 
     Returns:
-        Dict with ``batch_idx``, ``cls``, ``bboxes`` — or *None* if no
+        Dict with ``batch_idx``, ``cls``, ``bboxes`` (N,4 or N,5) — or *None* if no
         pseudo-labels match the current batch.
     """
     all_idx: List[int] = []
@@ -263,10 +319,15 @@ def build_yolo_batch_from_pseudo(
         if stem not in pseudo_labels:
             continue
         pl = pseudo_labels[stem]
+        bboxes = np.asarray(pl["bboxes"], dtype=np.float32)
+        if horizontal_flip_mask is not None and i < len(horizontal_flip_mask):
+            if bool(horizontal_flip_mask[i]):
+                bboxes = horizontal_flip_boxes(bboxes)
+
         n = len(pl["classes"])
         all_idx.extend([i] * n)
         all_cls.extend(pl["classes"].astype(float).tolist())
-        all_bboxes.extend(pl["bboxes"].tolist())
+        all_bboxes.extend(bboxes.tolist())
 
     if not all_idx:
         return None
@@ -285,6 +346,7 @@ def build_yolo_batch_from_pseudo(
 def targets_to_yolo_batch(
     targets: Dict[str, torch.Tensor],
     device: torch.device,
+    box_dim: int = 4,
 ) -> Dict[str, torch.Tensor]:
     """
     Convert the collated MTKD targets format::
@@ -292,9 +354,9 @@ def targets_to_yolo_batch(
         {"boxes": [B, max_obj, 4], "labels": [B, max_obj],
          "valid_mask": [B, max_obj]}
 
-    to the flat YOLO batch format expected by ``v8DetectionLoss``::
+    to the flat YOLO batch format expected by ``v8DetectionLoss`` / ``v8OBBLoss``::
 
-        {"batch_idx": [N], "cls": [N, 1], "bboxes": [N, 4]}
+        {"batch_idx": [N], "cls": [N, 1], "bboxes": [N, box_dim]}
     """
     boxes = targets["boxes"]    # [B, M, 4]
     labels = targets["labels"]  # [B, M]
@@ -318,13 +380,23 @@ def targets_to_yolo_batch(
             torch.full((n,), b, dtype=torch.float32, device=device)
         )
         cls_parts.append(labels[b][mask].float().unsqueeze(-1).to(device))
-        bbox_parts.append(boxes[b][mask].float().to(device))
+        selected_boxes = boxes[b][mask].float().to(device)
+        if selected_boxes.shape[-1] < box_dim:
+            pad = torch.zeros(
+                (selected_boxes.shape[0], box_dim - selected_boxes.shape[-1]),
+                dtype=selected_boxes.dtype,
+                device=device,
+            )
+            selected_boxes = torch.cat([selected_boxes, pad], dim=-1)
+        elif selected_boxes.shape[-1] > box_dim:
+            selected_boxes = selected_boxes[:, :box_dim]
+        bbox_parts.append(selected_boxes)
 
     if not batch_idx_parts:
         return {
             "batch_idx": torch.zeros(0, dtype=torch.float32, device=device),
             "cls": torch.zeros((0, 1), dtype=torch.float32, device=device),
-            "bboxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
+            "bboxes": torch.zeros((0, box_dim), dtype=torch.float32, device=device),
         }
 
     return {

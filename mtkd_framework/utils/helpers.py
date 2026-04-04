@@ -134,11 +134,20 @@ def load_checkpoint(
 
     # 載入優化器狀態
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as exc:
+            logging.warning(
+                "Skip optimizer state restore due to parameter-group mismatch: %s",
+                exc,
+            )
 
     # 載入調度器狀態
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        except Exception as exc:
+            logging.warning("Skip scheduler state restore: %s", exc)
 
     logging.info(f"Checkpoint loaded from {checkpoint_path}")
     return checkpoint

@@ -18,8 +18,7 @@ Changes from ``mtkd_model.py`` (v1):
 
 Backwards compat
 -----------------
-* ``MTKDModel`` in ``mtkd_model.py`` is untouched.
-* This module is a **standalone** alternative that can be swapped in via config.
+* This module is the active MTKD implementation used by ``run_v2.py``.
 """
 
 from __future__ import annotations
@@ -92,6 +91,8 @@ class MTKDModelV2(nn.Module):
         # DINO teacher
         dino_config: Optional[Dict[str, Any]] = None,
         dino_checkpoint: Optional[str] = None,
+        # Wheat detection teacher (for online pseudo labels)
+        wheat_teacher_config: Optional[Dict[str, Any]] = None,
         # Alignment head
         align_head_config: Optional[Dict[str, Any]] = None,
         student_align_layer: str = "p4",  # which pyramid level to align
@@ -126,6 +127,17 @@ class MTKDModelV2(nn.Module):
             dino_config["pretrained_path"] = dino_checkpoint
         self.dino_teacher = DinoFeatureExtractor(**dino_config)
         self._dino_embed_dim = dino_config["embed_dim"]
+
+        # =============================================================
+        # 2.5 Optional frozen Wheat detection teacher
+        # =============================================================
+        self.wheat_teacher: Optional[nn.Module] = None
+        if wheat_teacher_config is not None:
+            from .yolo_wrappers import YOLODetectionTeacher
+
+            wheat_cfg = dict(wheat_teacher_config)
+            wheat_cfg.setdefault("num_classes", num_classes)
+            self.wheat_teacher = YOLODetectionTeacher(**wheat_cfg)
 
         # =============================================================
         # 3. FFT block injection (before alignment head so encoder is ready)
@@ -328,6 +340,23 @@ class MTKDModelV2(nn.Module):
         }
 
     # ------------------------------------------------------------------
+    # Optional frozen detection-teacher helper
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def get_wheat_teacher_predictions(
+        self,
+        images: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Run the optional frozen wheat teacher for online pseudo-label generation.
+
+        Returns ``None`` if wheat teacher is not configured.
+        """
+        if self.wheat_teacher is None:
+            return None
+        return self.wheat_teacher(images)
+
+    # ------------------------------------------------------------------
     # Alignment helpers (called by the Trainer, not forward)
     # ------------------------------------------------------------------
     def compute_align_loss(
@@ -373,6 +402,8 @@ class MTKDModelV2(nn.Module):
         super().train(mode)
         # Keep frozen components in eval
         self.dino_teacher.train(False)
+        if self.wheat_teacher is not None:
+            self.wheat_teacher.train(False)
         if self.ensemble_teachers is not None:
             self.ensemble_teachers.train(False)
         return self
@@ -395,6 +426,7 @@ def build_mtkd_model_v2(config: Dict[str, Any]) -> MTKDModelV2:
             "student_config": {"student_type": "yolo", "weights": "yolo11s.pt", ...},
             "dino_config": {"model_name": "vit_base", "patch_size": 16, "embed_dim": 768},
             "dino_checkpoint": None,
+            "wheat_teacher_config": {"weights": "best.pt", "score_threshold": 0.3},
             "align_head_config": {"head_type": "MLP", "proj_dim": 1024, "normalize": True},
             "student_align_layer": "p4",
             "fft_block_config": {"after_blocks": [10], "num_freq_bins": 32},
@@ -407,6 +439,7 @@ def build_mtkd_model_v2(config: Dict[str, Any]) -> MTKDModelV2:
         num_classes=config.get("num_classes", 1),
         dino_config=config.get("dino_config"),
         dino_checkpoint=config.get("dino_checkpoint"),
+        wheat_teacher_config=config.get("wheat_teacher_config"),
         align_head_config=config.get("align_head_config"),
         student_align_layer=config.get("student_align_layer", "p4"),
         fft_block_config=config.get("fft_block_config"),

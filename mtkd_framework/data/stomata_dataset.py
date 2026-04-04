@@ -128,20 +128,35 @@ class StomataBarleyDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         boxes_np, labels_np = _parse_xml_boxes(label_path)
 
+        # Dual-view pipeline:
+        # - weak view: no geometric augmentation (for teacher alignment)
+        # - strong view: geometric augmentation (for student detection)
+        image_weak = image.copy()
+        image_strong = image.copy()
+        strong_hflip = False
+
         if self.augment and random.random() < 0.5:
-            image = ImageOps.mirror(image)
+            image_strong = ImageOps.mirror(image_strong)
+            strong_hflip = True
             if boxes_np.shape[0] > 0:
                 boxes_np[:, 0] = 1.0 - boxes_np[:, 0]
 
-        image = image.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
-        image_np = np.asarray(image, dtype=np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+        image_weak = image_weak.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+        image_strong = image_strong.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+
+        image_weak_np = np.asarray(image_weak, dtype=np.float32) / 255.0
+        image_strong_np = np.asarray(image_strong, dtype=np.float32) / 255.0
+
+        image_weak_tensor = torch.from_numpy(image_weak_np).permute(2, 0, 1).contiguous()
+        image_strong_tensor = torch.from_numpy(image_strong_np).permute(2, 0, 1).contiguous()
 
         boxes = torch.from_numpy(boxes_np)
         labels = torch.from_numpy(labels_np)
 
         return {
-            "images": image_tensor,
+            "images": image_strong_tensor,
+            "images_weak": image_weak_tensor,
+            "strong_hflip": strong_hflip,
             "targets": {
                 "boxes": boxes,
                 "labels": labels,
@@ -152,6 +167,11 @@ class StomataBarleyDataset(Dataset):
 
 def collate_stomata_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     images = torch.stack([item["images"] for item in batch], dim=0)
+    images_weak = torch.stack([item["images_weak"] for item in batch], dim=0)
+    strong_hflip = torch.tensor(
+        [bool(item.get("strong_hflip", False)) for item in batch],
+        dtype=torch.bool,
+    )
 
     max_targets = 0
     for item in batch:
@@ -172,6 +192,8 @@ def collate_stomata_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     return {
         "images": images,
+        "images_weak": images_weak,
+        "strong_hflip": strong_hflip,
         "targets": {
             "boxes": boxes,
             "labels": labels,
@@ -206,10 +228,24 @@ def build_stomata_dataloaders(
     indices = list(range(len(image_paths)))
     rng.shuffle(indices)
 
-    val_size = max(1, int(len(indices) * val_ratio))
+    # Keep training split non-empty for tiny datasets (e.g., BARLEY/1%).
+    n_samples = len(indices)
+    if n_samples == 1:
+        val_size = 0
+    else:
+        raw_val = int(n_samples * val_ratio)
+        # Ensure at least 1 val sample and at least 1 train sample.
+        val_size = max(1, min(raw_val, n_samples - 1))
+
     val_indices = set(indices[:val_size])
     train_paths = [image_paths[i] for i in indices if i not in val_indices]
     val_paths = [image_paths[i] for i in indices if i in val_indices]
+
+    if not train_paths:
+        raise ValueError(
+            f"No training samples after split. dataset_root={dataset_root}, "
+            f"image_subdir={image_subdir}, total_images={n_samples}, val_ratio={val_ratio}"
+        )
 
     train_dataset = StomataBarleyDataset(
         image_paths=train_paths,
