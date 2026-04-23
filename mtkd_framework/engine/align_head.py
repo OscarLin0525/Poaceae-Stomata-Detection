@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+import warnings
 
 
 class TeacherStudentAlignHead(nn.Module):
@@ -133,6 +134,44 @@ class TeacherStudentAlignHead(nn.Module):
             loss – scalar.
             (loss, sim) if ``return_sim`` is True.
         """
+        if feat_student.ndim != 4 or feat_teacher.ndim != 4:
+            raise ValueError(
+                "align_loss expects 4D tensors [B, C, H, W], got "
+                f"student={tuple(feat_student.shape)} teacher={tuple(feat_teacher.shape)}"
+            )
+
+        # Defensive fallback: if a stale cache or a short last-batch causes
+        # B mismatch, keep the overlapping samples instead of crashing.
+        if feat_student.shape[0] != feat_teacher.shape[0]:
+            min_b = min(int(feat_student.shape[0]), int(feat_teacher.shape[0]))
+            warnings.warn(
+                "align_loss batch mismatch "
+                f"student={int(feat_student.shape[0])}, teacher={int(feat_teacher.shape[0])}; "
+                f"using first {min_b} samples.",
+                RuntimeWarning,
+            )
+            if min_b <= 0:
+                zero = feat_student.new_tensor(0.0)
+                empty_sim = feat_student.new_empty((0, 1, 1, 1, 1))
+                return (zero, empty_sim) if return_sim else zero
+            feat_student = feat_student[:min_b]
+            feat_teacher = feat_teacher[:min_b]
+
+        # Keep spatial resolution aligned if caller forgot interpolation.
+        if feat_student.shape[2:] != feat_teacher.shape[2:]:
+            feat_student = F.interpolate(
+                feat_student,
+                size=feat_teacher.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if feat_student.shape[1] != feat_teacher.shape[1]:
+            raise ValueError(
+                "align_loss channel mismatch after projection: "
+                f"student_C={int(feat_student.shape[1])}, teacher_C={int(feat_teacher.shape[1])}"
+            )
+
         if self.normalize_feature:
             # per-pixel dot product
             feat_student = feat_student.permute(0, 2, 3, 1)  # [B, H, W, C]

@@ -2,6 +2,7 @@
 
 from .helpers import (
     load_checkpoint,
+    ModelEMA,
     save_checkpoint,
     setup_logger,
     AverageMeter,
@@ -17,6 +18,7 @@ from .helpers import (
 
 __all__ = [
     "load_checkpoint",
+    "ModelEMA",
     "save_checkpoint",
     "setup_logger",
     "AverageMeter",

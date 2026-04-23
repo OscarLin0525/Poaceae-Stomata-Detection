@@ -199,6 +199,35 @@ class UltralyticsCriterionAlignmentLoss(nn.Module):
             return loss.sum()
         return loss
 
+    @staticmethod
+    def _hyp_refs_for_box_dfl(criterion: Any) -> List[Any]:
+        """Collect criterion.hyp-like objects that expose mutable box/dfl gains."""
+        refs: List[Any] = []
+        seen = set()
+
+        candidates = [
+            criterion,
+            getattr(criterion, "one2many", None),
+            getattr(criterion, "one2one", None),
+            getattr(criterion, "vp_criterion", None),
+        ]
+
+        for cand in candidates:
+            if cand is None:
+                continue
+            hyp = getattr(cand, "hyp", None)
+            if hyp is None:
+                continue
+            if not (hasattr(hyp, "box") and hasattr(hyp, "dfl")):
+                continue
+            hid = id(hyp)
+            if hid in seen:
+                continue
+            seen.add(hid)
+            refs.append(hyp)
+
+        return refs
+
     def _criterion_loss(
         self,
         criterion: Any,
@@ -208,15 +237,20 @@ class UltralyticsCriterionAlignmentLoss(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if zero_box_dfl:
             # Keep cls guidance while disabling pseudo box/DFL regression.
-            orig_box = criterion.hyp.box
-            orig_dfl = criterion.hyp.dfl
-            criterion.hyp.box = 0.0
-            criterion.hyp.dfl = 0.0
-            try:
+            hyp_refs = self._hyp_refs_for_box_dfl(criterion)
+            if hyp_refs:
+                originals = [(h, h.box, h.dfl) for h in hyp_refs]
+                for h in hyp_refs:
+                    h.box = 0.0
+                    h.dfl = 0.0
+                try:
+                    loss, loss_items = criterion(raw_preds, pseudo_batch)
+                finally:
+                    for h, orig_box, orig_dfl in originals:
+                        h.box = orig_box
+                        h.dfl = orig_dfl
+            else:
                 loss, loss_items = criterion(raw_preds, pseudo_batch)
-            finally:
-                criterion.hyp.box = orig_box
-                criterion.hyp.dfl = orig_dfl
         else:
             loss, loss_items = criterion(raw_preds, pseudo_batch)
 

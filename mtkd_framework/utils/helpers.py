@@ -7,13 +7,17 @@ MTKD Utility Functions
 - 訓練工具
 """
 
+import copy
+import json
+import logging
+import math
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional, Any, List
+
 import torch
 import torch.nn as nn
-import logging
-import os
-from typing import Dict, Optional, Any, List
-from datetime import datetime
-import json
 
 
 def setup_logger(
@@ -67,6 +71,7 @@ def save_checkpoint(
     save_path: str,
     scheduler: Optional[Any] = None,
     extra_info: Optional[Dict] = None,
+    extra_state: Optional[Dict[str, Any]] = None,
 ):
     """
     保存訓練 checkpoint
@@ -79,6 +84,7 @@ def save_checkpoint(
         save_path: 保存路徑
         scheduler: 學習率調度器（可選）
         extra_info: 額外信息（可選）
+        extra_state: 額外 state，會直接展開到 checkpoint 頂層
     """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -95,6 +101,9 @@ def save_checkpoint(
 
     if extra_info is not None:
         checkpoint["extra_info"] = extra_info
+
+    if extra_state is not None:
+        checkpoint.update(extra_state)
 
     torch.save(checkpoint, save_path)
     logging.info(f"Checkpoint saved to {save_path}")
@@ -151,6 +160,83 @@ def load_checkpoint(
 
     logging.info(f"Checkpoint loaded from {checkpoint_path}")
     return checkpoint
+
+
+class ModelEMA:
+    """Lightweight EMA helper for validation/export smoothing."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.9999,
+        tau: float = 2000.0,
+    ):
+        self.decay = float(decay)
+        self.tau = float(tau)
+        self.updates = 0
+        self.ema = copy.deepcopy(model).eval()
+        self._backup: Optional[Dict[str, torch.Tensor]] = None
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
+
+    def _decay_value(self) -> float:
+        if self.tau <= 0:
+            return self.decay
+        return self.decay * (1.0 - math.exp(-self.updates / self.tau))
+
+    @torch.no_grad()
+    def set(self, model: nn.Module) -> None:
+        self.ema.load_state_dict(model.state_dict(), strict=False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.updates += 1
+        decay = self._decay_value()
+        model_state = model.state_dict()
+        ema_state = self.ema.state_dict()
+        for key, ema_value in ema_state.items():
+            model_value = model_state.get(key, None)
+            if model_value is None:
+                continue
+            model_value = model_value.detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.lerp_(model_value, 1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
+    @torch.no_grad()
+    def store(self, model: nn.Module) -> None:
+        self._backup = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        model.load_state_dict(self.ema.state_dict(), strict=False)
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if self._backup is None:
+            return
+        model.load_state_dict(self._backup, strict=False)
+        self._backup = None
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "ema_state_dict": self.ema.state_dict(),
+            "updates": int(self.updates),
+            "decay": float(self.decay),
+            "tau": float(self.tau),
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        ema_state = state.get("ema_state_dict", state)
+        self.ema.load_state_dict(ema_state, strict=False)
+        self.updates = int(state.get("updates", 0))
+        self.decay = float(state.get("decay", self.decay))
+        self.tau = float(state.get("tau", self.tau))
 
 
 class AverageMeter:
@@ -395,7 +481,26 @@ def save_config(config: Dict, save_path: str):
 
 
 def load_config(config_path: str) -> Dict:
-    """從 JSON 文件載入配置"""
-    with open(config_path, "r") as f:
-        config = json.load(f)
+    """從 JSON/YAML 文件載入配置"""
+    path = Path(config_path)
+    suffix = path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(
+                "YAML config requires PyYAML. Install with: pip install pyyaml"
+            ) from exc
+
+        with open(path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+            config = {} if config is None else config
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Config file must contain a mapping/object at top level, got {type(config).__name__}"
+        )
     return config

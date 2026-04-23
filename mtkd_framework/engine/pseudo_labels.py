@@ -111,7 +111,7 @@ def horizontal_flip_boxes(bboxes: np.ndarray) -> np.ndarray:
 
 def parse_yolo_txt(
     txt_path: str,
-    score_threshold: float = 0.0,
+    score_threshold: Optional[float] = None,
     convert_obb: bool = True,
     target_box_format: str = "xywh",
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,7 +183,7 @@ def parse_yolo_txt(
         if target_box_format == "xywhr" and len(bbox) == 4:
             bbox = bbox + [0.0]
 
-        if conf >= score_threshold:
+        if score_threshold is None or conf >= float(score_threshold):
             classes_list.append(cls)
             bboxes_list.append(bbox[:out_dim])
 
@@ -202,7 +202,7 @@ def parse_yolo_txt(
 
 def load_pseudo_labels_dir(
     label_dir: str,
-    score_threshold: float = 0.5,
+    score_threshold: Optional[float] = None,
     convert_obb: bool = True,
     target_box_format: str = "xywh",
 ) -> Dict[str, Dict[str, np.ndarray]]:
@@ -243,7 +243,7 @@ def load_pseudo_labels_csv(
     class_col: str = "class",
     bbox_cols: Sequence[str] = ("cx", "cy", "w", "h"),
     score_col: Optional[str] = "confidence",
-    score_threshold: float = 0.5,
+    score_threshold: Optional[float] = None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """
     Load pseudo-labels from a CSV file.
@@ -260,7 +260,7 @@ def load_pseudo_labels_csv(
         for row in reader:
             if score_col and score_col in row:
                 conf = float(row[score_col])
-                if conf < score_threshold:
+                if score_threshold is not None and conf < float(score_threshold):
                     continue
 
             stem = Path(row[image_col]).stem
@@ -351,14 +351,14 @@ def targets_to_yolo_batch(
     """
     Convert the collated MTKD targets format::
 
-        {"boxes": [B, max_obj, 4], "labels": [B, max_obj],
+        {"boxes": [B, max_obj, K], "labels": [B, max_obj],
          "valid_mask": [B, max_obj]}
 
     to the flat YOLO batch format expected by ``v8DetectionLoss`` / ``v8OBBLoss``::
 
         {"batch_idx": [N], "cls": [N, 1], "bboxes": [N, box_dim]}
     """
-    boxes = targets["boxes"]    # [B, M, 4]
+    boxes = targets["boxes"]    # [B, M, K]
     labels = targets["labels"]  # [B, M]
     valid = targets.get("valid_mask")
 

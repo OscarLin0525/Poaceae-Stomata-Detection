@@ -76,25 +76,69 @@ def _pred_to_boxes_and_logits(
     task = task.lower()
     is_obb = task == "obb"
 
-    # Ultralytics decoded boxes are in pixel cxcywh (and +angle for OBB).
-    box_dim = 5 if is_obb else 4
-    boxes_all = pred[:, :box_dim, :].permute(0, 2, 1).contiguous()
-    boxes = boxes_all[..., :4]
+    def _prob_like_ratio(x: Optional[torch.Tensor]) -> float:
+        if x is None or x.numel() == 0:
+            return -1.0
+        return float(((x >= 0.0) & (x <= 1.0)).float().mean().item())
+
+    if is_obb:
+        # Ultralytics OBB decoded tensors can appear in two layouts:
+        # A) [x, y, w, h, angle, cls...]
+        # B) [x, y, w, h, cls..., angle]
+        c = int(pred.shape[1])
+        if num_classes is None:
+            num_classes = max(1, c - 5)
+
+        if c < num_classes + 5:
+            raise ValueError(
+                f"Unexpected OBB decoded channels: C={c}, num_classes={num_classes}"
+            )
+
+        cls_a = pred[:, 5:5 + num_classes, :] if c >= 5 + num_classes else None
+        angle_a = pred[:, 4:5, :]
+        score_a = _prob_like_ratio(cls_a) + (1.0 - _prob_like_ratio(angle_a))
+
+        cls_b = pred[:, 4:4 + num_classes, :] if c >= 4 + num_classes else None
+        angle_b = (
+            pred[:, 4 + num_classes:4 + num_classes + 1, :]
+            if c >= 4 + num_classes + 1
+            else None
+        )
+        score_b = _prob_like_ratio(cls_b) + (1.0 - _prob_like_ratio(angle_b))
+
+        use_layout_b = cls_b is not None and angle_b is not None and score_b >= score_a
+        if use_layout_b:
+            boxes = pred[:, :4, :].permute(0, 2, 1).contiguous()
+            angles = angle_b.permute(0, 2, 1).contiguous()
+            cls_raw = cls_b
+        else:
+            boxes_all = pred[:, :5, :].permute(0, 2, 1).contiguous()
+            boxes = boxes_all[..., :4]
+            angles = boxes_all[..., 4:5]
+            if cls_a is None:
+                raise ValueError(
+                    f"Cannot parse OBB class channels from decoded shape {tuple(pred.shape)}"
+                )
+            cls_raw = cls_a
+    else:
+        boxes = pred[:, :4, :].permute(0, 2, 1).contiguous()
+        angles = None
+        if num_classes is None:
+            num_classes = int(pred.shape[1] - 4)
+        cls_raw = pred[:, 4:4 + num_classes, :]
+
     scale = boxes.new_tensor([image_w, image_h, image_w, image_h]).view(1, 1, 4)
     boxes = (boxes / scale).clamp(0.0, 1.0)
-    angles = boxes_all[..., 4:5] if is_obb else None
 
-    cls_start = box_dim
-    if num_classes is None:
-        # OBB decoded pred can contain one extra angle channel at the tail.
-        tail = pred.shape[1] - cls_start
-        if is_obb and tail > 1:
-            num_classes = tail - 1
-        else:
-            num_classes = tail
+    cls_raw = cls_raw.permute(0, 2, 1).contiguous()
 
-    cls_prob = pred[:, cls_start:cls_start + num_classes, :]
-    cls_prob = cls_prob.permute(0, 2, 1).contiguous().clamp(1e-6, 1 - 1e-6)
+    # Ultralytics heads can expose either probabilities ([0, 1]) or logits.
+    # If values fall outside [0, 1], interpret them as logits.
+    if float(cls_raw.min()) < 0.0 or float(cls_raw.max()) > 1.0:
+        cls_prob = cls_raw.sigmoid()
+    else:
+        cls_prob = cls_raw
+    cls_prob = cls_prob.clamp(1e-6, 1 - 1e-6)
     cls_logits = torch.log(cls_prob / (1.0 - cls_prob))
 
     scores, labels = cls_prob.max(dim=-1)
@@ -471,7 +515,8 @@ class YOLODetectionTeacher(nn.Module):
     def __init__(
         self,
         weights: str = "yolov8s.pt",
-        score_threshold: float = 0.001,
+        score_threshold: Optional[float] = None,
+        nms_iou: Optional[float] = None,
         max_detections: int = 300,
         num_classes: Optional[int] = None,
     ):
@@ -482,10 +527,15 @@ class YOLODetectionTeacher(nn.Module):
             raise ImportError("ultralytics is required for YOLO wrappers") from exc
 
         yolo_obj = YOLO(weights)
+        # Keep Ultralytics high-level runner out of nn.Module children.
+        # Otherwise parent ``model.train()`` may recurse into ``YOLO.train``
+        # with a boolean ``mode`` and trigger a TypeError.
+        object.__setattr__(self, "_yolo_infer", yolo_obj)
         self.det_model = yolo_obj.model
         self.task = str(getattr(yolo_obj, "task", "detect")).lower()
         self.box_dim = 5 if self.task == "obb" else 4
         self.score_threshold = score_threshold
+        self.nms_iou = nms_iou
         self.max_detections = max_detections
         self.num_classes = num_classes
 
@@ -493,55 +543,76 @@ class YOLODetectionTeacher(nn.Module):
             p.requires_grad = False
         self.det_model.eval()
 
+    def train(self, mode: bool = True):
+        # Teacher is frozen; always keep it in eval mode.
+        super().train(False)
+        self.det_model.eval()
+        return self
+
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        was_training = self.det_model.training
-        self.det_model.eval()
-        output = self.det_model(images)
-        if was_training:
-            self.det_model.train()
+        # Use Ultralytics post-NMS results for pseudo labels.
+        device_arg: object = images.device.index if images.is_cuda else "cpu"
+        predict_kwargs = {
+            "verbose": False,
+            "device": device_arg,
+        }
+        if self.score_threshold is not None:
+            predict_kwargs["conf"] = float(self.score_threshold)
+        if self.nms_iou is not None:
+            predict_kwargs["iou"] = float(self.nms_iou)
+        if self.max_detections is not None:
+            predict_kwargs["max_det"] = int(self.max_detections)
 
-        pred, _, _ = _decode_ultralytics_output(output)
-        if pred is None:
-            raise RuntimeError("YOLO teacher output does not contain decoded predictions")
+        results = self._yolo_infer(images, **predict_kwargs)
 
-        image_h, image_w = images.shape[-2:]
-        boxes, _, scores, labels, angles = _pred_to_boxes_and_logits(
-            pred, image_h, image_w, num_classes=self.num_classes, task=self.task
-        )
-        if angles is not None:
-            boxes = torch.cat([boxes, angles], dim=-1)
-
-        # Apply per-image threshold and top-k, then pad to batch tensor.
+        # Apply class filtering and pad to batch tensor.
         batch_boxes: List[torch.Tensor] = []
         batch_scores: List[torch.Tensor] = []
         batch_labels: List[torch.Tensor] = []
         max_keep = 1
 
-        for b in range(boxes.shape[0]):
-            mask = scores[b] >= self.score_threshold
-            if self.num_classes is not None:
-                mask = mask & (labels[b] < self.num_classes)
-            b_boxes = boxes[b][mask]
-            b_scores = scores[b][mask]
-            b_labels = labels[b][mask]
+        for r in results:
+            b_boxes: torch.Tensor
+            b_scores: torch.Tensor
+            b_labels: torch.Tensor
 
-            if b_scores.numel() > self.max_detections:
-                topk = torch.topk(b_scores, k=self.max_detections)
-                keep = topk.indices
+            if self.task == "obb" and getattr(r, "obb", None) is not None and len(r.obb) > 0:
+                obb = r.obb
+                h, w = r.orig_shape
+                xywhr = obb.xywhr.to(device=images.device, dtype=torch.float32)
+                norm = xywhr.new_tensor([w, h, w, h, 1.0]).view(1, 5)
+                b_boxes = (xywhr / norm).to(dtype=torch.float32)
+                b_boxes[:, :4] = b_boxes[:, :4].clamp(0.0, 1.0)
+                b_scores = obb.conf.to(device=images.device, dtype=torch.float32)
+                b_labels = obb.cls.to(device=images.device, dtype=torch.long)
+            elif getattr(r, "boxes", None) is not None and len(r.boxes) > 0:
+                bb = r.boxes
+                b_boxes = bb.xywhn.to(device=images.device, dtype=torch.float32)
+                b_boxes = b_boxes.clamp(0.0, 1.0)
+                b_scores = bb.conf.to(device=images.device, dtype=torch.float32)
+                b_labels = bb.cls.to(device=images.device, dtype=torch.long)
+            else:
+                b_boxes = images.new_zeros((0, self.box_dim))
+                b_scores = images.new_zeros((0,), dtype=torch.float32)
+                b_labels = images.new_zeros((0,), dtype=torch.long)
+
+            if self.num_classes is not None and b_labels.numel() > 0:
+                keep = b_labels < int(self.num_classes)
                 b_boxes = b_boxes[keep]
                 b_scores = b_scores[keep]
                 b_labels = b_labels[keep]
 
-            max_keep = max(max_keep, b_scores.numel())
+            max_keep = max(max_keep, int(b_scores.numel()))
             batch_boxes.append(b_boxes)
             batch_scores.append(b_scores)
             batch_labels.append(b_labels)
 
-        padded_boxes = boxes.new_zeros((boxes.shape[0], max_keep, boxes.shape[-1]))
-        padded_scores = scores.new_full((scores.shape[0], max_keep), -1.0)
-        padded_labels = labels.new_zeros((labels.shape[0], max_keep), dtype=torch.long)
-        valid_mask = torch.zeros((labels.shape[0], max_keep), dtype=torch.bool, device=labels.device)
+        batch_size = len(batch_boxes)
+        padded_boxes = images.new_zeros((batch_size, max_keep, self.box_dim), dtype=torch.float32)
+        padded_scores = images.new_full((batch_size, max_keep), -1.0, dtype=torch.float32)
+        padded_labels = images.new_zeros((batch_size, max_keep), dtype=torch.long)
+        valid_mask = torch.zeros((batch_size, max_keep), dtype=torch.bool, device=images.device)
 
         for b, (b_boxes, b_scores, b_labels) in enumerate(zip(batch_boxes, batch_scores, batch_labels)):
             n = b_scores.numel()

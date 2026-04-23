@@ -8,7 +8,7 @@ Changes from ``mtkd_model.py`` (v1):
    proper preprocessing, frozen).
 2. **FeatureAdapter** (``nn.Linear`` + global pool) → ``engine.TeacherStudentAlignHead``
    (``nn.Conv2d(1×1)`` per-pixel + ``F.interpolate``).  This fixes **C1/M1**.
-3. ``PluggableFFTBlock`` optionally injected into the frozen DINO encoder.
+3. MTKD-side FFT injection is disabled; DINO stays frozen and unmodified.
 4. Pseudo-label pathway mirrors DINO Teacher: filtered pseudo-labels are treated
    as GT supervision (standard detection loss), **not** element-wise KL.
    The user's pretrained wheat model supplies these PLs externally (see
@@ -32,7 +32,6 @@ import torch.nn.functional as F
 
 from ..engine.build_dino import DinoFeatureExtractor
 from ..engine.align_head import TeacherStudentAlignHead
-from ..engine.pluggable_fft_block import inject_fft_blocks, PluggableFFTBlock
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +95,7 @@ class MTKDModelV2(nn.Module):
         # Alignment head
         align_head_config: Optional[Dict[str, Any]] = None,
         student_align_layer: str = "p4",  # which pyramid level to align
-        # FFT block injection
+        # Legacy arg kept for config compatibility (ignored)
         fft_block_config: Optional[Dict[str, Any]] = None,
         # Ensemble teachers (kept for backwards compat)
         ensemble_config: Optional[Dict[str, Any]] = None,
@@ -114,6 +113,24 @@ class MTKDModelV2(nn.Module):
         else:
             student_config = dict(student_config or {})
             self.student = _build_student(student_config, num_classes)
+
+        # MTKD v2 trainer currently relies on Ultralytics-style student APIs.
+        required_student_api = (
+            "forward_train_raw",
+            "compute_loss",
+            "_ensure_criterion",
+        )
+        missing_api = [
+            name for name in required_student_api
+            if not callable(getattr(self.student, name, None))
+        ]
+        if missing_api:
+            raise TypeError(
+                "MTKDModelV2 requires a YOLO-style student interface. "
+                f"Got {self.student.__class__.__name__} missing methods: {missing_api}. "
+                "Use YOLOStudentDetector or adapt the student implementation to expose "
+                "forward_train_raw/compute_loss/_ensure_criterion."
+            )
 
         # =============================================================
         # 2. Frozen DINO Feature Extractor
@@ -140,21 +157,13 @@ class MTKDModelV2(nn.Module):
             self.wheat_teacher = YOLODetectionTeacher(**wheat_cfg)
 
         # =============================================================
-        # 3. FFT block injection (before alignment head so encoder is ready)
+        # 3. MTKD-side FFT injection disabled
         # =============================================================
-        self.fft_blocks: List[PluggableFFTBlock] = []
+        self.fft_blocks: List[nn.Module] = []
         if fft_block_config is not None:
-            fft_cfg = dict(fft_block_config)
-            after_blocks = fft_cfg.pop("after_blocks", [10])
-            fft_cfg.setdefault("embed_dim", self._dino_embed_dim)
-            fft_cfg.setdefault("freeze_original", True)
-            self.fft_blocks = inject_fft_blocks(
-                self.dino_teacher.encoder,
-                after_blocks=after_blocks,
-                **fft_cfg,
+            logger.warning(
+                "fft_block_config is ignored: MTKD FFT/PluggableFFTBlock has been disabled."
             )
-            # Make them part of the model so they are saved / loaded
-            self.fft_block_list = nn.ModuleList(self.fft_blocks)
 
         # =============================================================
         # 4. Alignment Head
@@ -263,12 +272,8 @@ class MTKDModelV2(nn.Module):
 
         # ----- DINO teacher forward -----
         if return_teacher_features:
-            if self.fft_blocks:
-                # FFT blocks need gradients → run with grad enabled
+            with torch.no_grad():
                 dino_feat = self.dino_teacher(images)
-            else:
-                with torch.no_grad():
-                    dino_feat = self.dino_teacher(images)
             result["dino_features"] = dino_feat
 
         return result
@@ -324,12 +329,8 @@ class MTKDModelV2(nn.Module):
         dino_feat: Optional[torch.Tensor] = None
         if compute_dino:
             dino_input = teacher_images if teacher_images is not None else images
-            if self.fft_blocks:
-                # FFT blocks need gradients → run with grad enabled
-                dino_feat = self.dino_teacher(dino_input)
-            else:
-                with torch.no_grad():
-                    dino_feat = self.dino_teacher(dino_input)  # [B, D, H_p, W_p]
+            with torch.no_grad():
+                dino_feat = self.dino_teacher(dino_input)  # [B, D, H_p, W_p]
 
         return {
             "raw_preds": raw_preds,
@@ -378,6 +379,64 @@ class MTKDModelV2(nn.Module):
         projected = self.align_head(student_spatial_feat, dino_features.shape[2:])
         return self.align_head.align_loss(projected, dino_features)
 
+    @torch.no_grad()
+    def get_alignment_debug(
+        self,
+        images: torch.Tensor,
+        teacher_images: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Return intermediate tensors for visualizing feature alignment.
+
+        Outputs:
+            ``student_spatial_feat``: raw student feature map at the configured
+                pyramid level, shape ``[B, C_s, H_s, W_s]``.
+            ``projected_student_feat``: student feature after alignment-head
+                projection into DINO space, shape ``[B, C_t, H_t, W_t]``.
+            ``dino_features``: frozen DINO teacher feature map,
+                shape ``[B, C_t, H_t, W_t]``.
+            ``similarity_map``: per-pixel cosine similarity map from
+                ``align_loss(return_sim=True)``, shape ``[B, H_t, W_t]``.
+            ``align_loss``: scalar alignment loss for the batch.
+        """
+        was_training = self.training
+        self.eval()
+
+        student_out = self.student(
+            images,
+            return_features=True,
+            return_adapted_features=False,
+        )
+
+        feat_key = f"{self.student_align_layer}_features"
+        student_spatial = student_out.get(feat_key)
+        if student_spatial is None:
+            raise RuntimeError(
+                f"Student output does not contain {feat_key}; cannot inspect alignment."
+            )
+
+        self._ensure_align_head(student_spatial.shape[1], student_spatial.device)
+        assert self.align_head is not None, "Alignment head not initialised yet"
+
+        dino_input = teacher_images if teacher_images is not None else images
+        dino_feat = self.dino_teacher(dino_input)
+        projected = self.align_head(student_spatial, dino_feat.shape[2:])
+        align_loss, sim = self.align_head.align_loss(projected, dino_feat, return_sim=True)
+        sim_map = sim.squeeze(-1).squeeze(-1)
+
+        if was_training:
+            self.train(True)
+        else:
+            self.eval()
+
+        return {
+            "student_spatial_feat": student_spatial.detach(),
+            "projected_student_feat": projected.detach(),
+            "dino_features": dino_feat.detach(),
+            "similarity_map": sim_map.detach(),
+            "align_loss": align_loss.detach(),
+        }
+
     # ------------------------------------------------------------------
     # Trainable parameter helpers
     # ------------------------------------------------------------------
@@ -388,15 +447,11 @@ class MTKDModelV2(nn.Module):
                 params.append(p)
         if self.align_head is not None:
             params.extend(self.align_head.parameters())
-        for blk in self.fft_blocks:
-            params.extend(blk.parameters())
         return params
 
     def get_fft_parameters(self) -> List[nn.Parameter]:
-        params: List[nn.Parameter] = []
-        for blk in self.fft_blocks:
-            params.extend(blk.parameters())
-        return params
+        # MTKD-side FFT injection disabled.
+        return []
 
     def train(self, mode: bool = True):
         super().train(mode)

@@ -10,6 +10,7 @@ torchvision>=0.16.0
 ultralytics>=8.1.0
 
 # ---- DINOv3 backbone dependencies ----
+transformers
 torchmetrics
 omegaconf
 termcolor
@@ -20,9 +21,12 @@ regex
 # ---- Scientific computing ----
 numpy>=1.24.0
 scipy                # Hungarian matching (linear_sum_assignment)
+scikit-learn         # PCA for feature-map visualization
 
 # ---- Image processing ----
 Pillow>=9.0.0
+scikit-image
+PyWavelets
 
 # ---- Visualization & logging ----
 matplotlib
