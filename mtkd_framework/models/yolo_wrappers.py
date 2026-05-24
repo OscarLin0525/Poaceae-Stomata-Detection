@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import torch
@@ -19,6 +21,13 @@ import torch.nn as nn
 from .student_model import FeatureAdapter
 
 logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ULTRALYTICS_ROOT = REPO_ROOT / "ultralytics"
+if ULTRALYTICS_ROOT.is_dir():
+    ultra_path = str(ULTRALYTICS_ROOT)
+    if ultra_path not in sys.path:
+        sys.path.insert(0, ultra_path)
 
 
 def _decode_ultralytics_output(
@@ -161,6 +170,8 @@ class YOLOStudentDetector(nn.Module):
     def __init__(
         self,
         weights: str = "yolo11s.pt",
+        model_yaml: Optional[str] = None,
+        support_gate_config: Optional[Dict[str, Any]] = None,
         dino_teacher_dim: int = 768,
         feature_level: Literal["p3", "p4", "p5"] = "p4",
         adapter_type: Literal["linear", "mlp", "attention"] = "mlp",
@@ -172,10 +183,31 @@ class YOLOStudentDetector(nn.Module):
         except ImportError as exc:
             raise ImportError("ultralytics is required for YOLO wrappers") from exc
 
-        yolo_obj = YOLO(weights)
-        self.det_model = yolo_obj.model
-        self.task = str(getattr(yolo_obj, "task", "detect")).lower()
+        if model_yaml:
+            from ultralytics.nn.tasks import DetectionModel, OBBModel, load_checkpoint
+
+            yaml_path = str(model_yaml)
+            task_hint = "obb" if "obb" in Path(yaml_path).stem.lower() else "detect"
+            if task_hint == "obb":
+                self.det_model = OBBModel(cfg=yaml_path, nc=num_classes, verbose=False)
+            else:
+                self.det_model = DetectionModel(cfg=yaml_path, nc=num_classes, verbose=False)
+            if weights and Path(str(weights)).suffix.lower() in {".pt", ".pth"}:
+                try:
+                    _loaded_model, ckpt = load_checkpoint(str(weights), device="cpu", fuse=False)
+                    self.det_model.load(ckpt, verbose=True)
+                    logger.info("Loaded pretrained YOLO weights %s into architecture %s", weights, model_yaml)
+                except Exception as exc:
+                    logger.warning("Failed to load pretrained YOLO weights %s into %s: %s", weights, model_yaml, exc)
+            yolo_task = task_hint
+        else:
+            yolo_obj = YOLO(weights)
+            self.det_model = yolo_obj.model
+            yolo_task = str(getattr(yolo_obj, "task", "detect")).lower()
+        self.task = yolo_task
         self.box_dim = 5 if self.task == "obb" else 4
+        self._support_gate_config = dict(support_gate_config or {})
+        self._inject_native_support_gates()
         # Ultralytics checkpoints may load with frozen params; ensure student is trainable.
         for p in self.det_model.parameters():
             p.requires_grad = True
@@ -192,6 +224,101 @@ class YOLOStudentDetector(nn.Module):
 
         self._last_neck_features: Optional[List[torch.Tensor]] = None
         self._register_detect_prehook()
+
+    def _inject_native_support_gates(self) -> None:
+        cfg = dict(self._support_gate_config or {})
+        if not bool(cfg.get("enabled", False)):
+            return
+        if not hasattr(self.det_model, "model") or len(self.det_model.model) < 1:
+            return
+        detect_module = self.det_model.model[-1]
+        detect_from = list(getattr(detect_module, "f", []))
+        if len(detect_from) < 1:
+            logger.warning("support_gate_config enabled but Detect/OBB head has no pyramid inputs")
+            return
+
+        from ultralytics.nn.modules import SpatialSupportGate
+
+        level_to_pos = {"p3": 0, "p4": 1, "p5": 2}
+        raw_levels = cfg.get("levels", ["p3"])
+        levels = [str(x).lower() for x in raw_levels] if isinstance(raw_levels, (list, tuple)) else [str(raw_levels).lower()]
+        kernel_size = int(cfg.get("kernel_size", 3))
+        strength = float(cfg.get("strength", 0.35))
+        bg_scale = float(cfg.get("bg_scale", 1.0))
+        fg_scale = float(cfg.get("fg_scale", bg_scale + strength))
+        init_bias = float(cfg.get("init_bias", -4.0))
+
+        modules = list(self.det_model.model[:-1])
+        new_detect_from = list(detect_from)
+        inserted_records: List[Tuple[str, int, int]] = []
+        for level in levels:
+            pos = level_to_pos.get(level)
+            if pos is None or pos >= len(detect_from):
+                logger.warning("Skipping unsupported support gate level %s for detect inputs %s", level, detect_from)
+                continue
+            src_idx = int(detect_from[pos])
+            src_layer = self.det_model.model[src_idx]
+            out_ch = getattr(src_layer, "c2", None)
+            if out_ch is None:
+                # Fallback: infer channels from the Detect branch's first conv.
+                try:
+                    branch0 = detect_module.cv2[pos][0]
+                    conv = getattr(branch0, "conv", None)
+                    if isinstance(conv, nn.Conv2d):
+                        out_ch = int(conv.in_channels)
+                except Exception:
+                    out_ch = None
+            if out_ch is None:
+                logger.warning("Cannot infer channels for support gate level=%s src=%s; skipped", level, src_idx)
+                continue
+            gate = SpatialSupportGate(
+                int(out_ch),
+                kernel_size=kernel_size,
+                strength=strength,
+                bg_scale=bg_scale,
+                fg_scale=fg_scale,
+                init_bias=init_bias,
+            )
+            gate_idx = len(modules)
+            gate.i = gate_idx
+            gate.f = src_idx
+            gate.type = f"{gate.__module__}.{gate.__class__.__name__}"
+            gate.np = sum(p.numel() for p in gate.parameters())
+            modules.append(gate)
+            new_detect_from[pos] = gate_idx
+            inserted_records.append((level, src_idx, gate_idx))
+
+        if not inserted_records:
+            return
+
+        detect_module.f = new_detect_from
+        detect_module.i = len(modules)
+        modules.append(detect_module)
+        self.det_model.model = nn.Sequential(*modules)
+        existing_save = set(getattr(self.det_model, "save", []))
+        existing_save.update(int(src) for _level, src, _gate in inserted_records)
+        existing_save.update(int(gate) for _level, _src, gate in inserted_records)
+        existing_save.update(int(x) for x in new_detect_from if int(x) != -1)
+        self.det_model.save = sorted(existing_save)
+
+        yaml_cfg = getattr(self.det_model, "yaml", None)
+        if isinstance(yaml_cfg, dict) and isinstance(yaml_cfg.get("head"), list) and yaml_cfg["head"]:
+            old_head = list(yaml_cfg["head"])
+            old_detect = old_head[-1]
+            head_without_detect = old_head[:-1]
+            # Layer indices are absolute in the already parsed model. Adding gates immediately before the head
+            # keeps all previous indices stable and lets clean export rebuild the same graph.
+            for level, src_idx, gate_idx in inserted_records:
+                head_without_detect.append(
+                    [src_idx, 1, "SpatialSupportGate", [kernel_size, strength, bg_scale, fg_scale, init_bias]]
+                )
+            old_detect = [list(old_detect[0]) if isinstance(old_detect[0], (list, tuple)) else old_detect[0], *old_detect[1:]]
+            old_detect[0] = list(new_detect_from)
+            yaml_cfg["head"] = head_without_detect + [old_detect]
+        logger.info(
+            "Inserted native SpatialSupportGate(s): %s",
+            ", ".join(f"{lvl}: {src}->{gate}" for lvl, src, gate in inserted_records),
+        )
 
     def _register_detect_prehook(self) -> None:
         detect_module = None
@@ -210,6 +337,7 @@ class YOLOStudentDetector(nn.Module):
                     break
         if detect_module is None:
             raise RuntimeError("Could not locate Detect module in YOLO model")
+        self._detect_module = detect_module
 
         def _cache_neck_input(_module, inputs):
             if not inputs:
@@ -222,6 +350,27 @@ class YOLOStudentDetector(nn.Module):
                 self._last_neck_features = None
 
         detect_module.register_forward_pre_hook(_cache_neck_input)
+
+    def get_support_gate_maps(self) -> List[Dict[str, torch.Tensor | int | str]]:
+        """Return native SpatialSupportGate logits/masks cached by the latest forward pass."""
+        records: List[Dict[str, torch.Tensor | int | str]] = []
+        if not hasattr(self.det_model, "model"):
+            return records
+        for idx, module in enumerate(self.det_model.model):
+            if not bool(getattr(module, "is_support_gate", False)):
+                continue
+            logits = getattr(module, "last_logits", None)
+            mask = getattr(module, "last_mask", None)
+            if isinstance(logits, torch.Tensor) and isinstance(mask, torch.Tensor):
+                records.append(
+                    {
+                        "index": int(idx),
+                        "type": module.__class__.__name__,
+                        "logits": logits,
+                        "mask": mask,
+                    }
+                )
+        return records
 
     def _ensure_feature_adapter(self, in_channels: int, device: torch.device) -> None:
         if self.feature_adapter is None:
@@ -324,6 +473,7 @@ class YOLOStudentDetector(nn.Module):
     def forward_train_raw(
         self,
         images: torch.Tensor,
+        feature_gate: Optional[Dict[str, torch.Tensor | float | str]] = None,
     ) -> Tuple[object, Dict[str, torch.Tensor]]:
         """
         Run the student YOLO in **training mode** to obtain raw predictions
@@ -344,10 +494,57 @@ class YOLOStudentDetector(nn.Module):
         """
         self._last_neck_features = None
         self.det_model.train()
-        # In train mode the Detect head returns raw predictions (not decoded).
-        # Use direct __call__ (nn.Module forward), NOT .predict() which is
-        # the high-level Ultralytics inference API with NMS/postprocessing.
-        raw_preds = self.det_model(images)
+        hook_handle = None
+        if feature_gate is not None:
+            level = str(feature_gate.get("level", self.feature_level)).lower()
+            strength = float(feature_gate.get("strength", 1.0))
+            support = feature_gate.get("support")
+            hard = bool(feature_gate.get("hard", False))
+            threshold = float(feature_gate.get("threshold", 0.5))
+            bg_scale = feature_gate.get("bg_scale")
+            fg_scale = feature_gate.get("fg_scale")
+            if isinstance(support, torch.Tensor):
+                level_idx = self.feature_level_to_idx.get(level, self.feature_level_to_idx[self.feature_level])
+
+                def _apply_gate(_module, inputs):
+                    if not inputs:
+                        return None
+                    x = inputs[0]
+                    if not isinstance(x, (list, tuple)):
+                        return None
+                    feats = list(x)
+                    if level_idx >= len(feats):
+                        return None
+                    target = feats[level_idx]
+                    gate = support.to(device=target.device, dtype=target.dtype)
+                    if gate.ndim == 3:
+                        gate = gate.unsqueeze(1)
+                    gate = torch.nn.functional.interpolate(
+                        gate,
+                        size=target.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    if hard:
+                        gate = (gate >= threshold).to(dtype=target.dtype)
+                    if bg_scale is not None or fg_scale is not None:
+                        bg = float(1.0 if bg_scale is None else bg_scale)
+                        fg = float((1.0 + strength) if fg_scale is None else fg_scale)
+                        scale = bg + (fg - bg) * gate
+                    else:
+                        scale = 1.0 + strength * gate
+                    feats[level_idx] = target * scale
+                    return (tuple(feats),) if isinstance(x, tuple) else (feats,)
+
+                hook_handle = self._detect_module.register_forward_pre_hook(_apply_gate)
+        try:
+            # In train mode the Detect head returns raw predictions (not decoded).
+            # Use direct __call__ (nn.Module forward), NOT .predict() which is
+            # the high-level Ultralytics inference API with NMS/postprocessing.
+            raw_preds = self.det_model(images)
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
         features: Dict[str, torch.Tensor] = {}
         if self._last_neck_features is not None and len(self._last_neck_features) >= 3:

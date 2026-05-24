@@ -72,6 +72,16 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Path to DINO pretrained checkpoint (.pth)")
     g.add_argument("--align-head-type", type=str, default="MLP",
                    choices=["attention", "MLP", "MLP3", "linear"])
+    g.add_argument("--stomata-prior", dest="stomata_prior", action="store_true", default=None,
+                   help="Enable DINO-space stomata prior head for masked feature alignment")
+    g.add_argument("--no-stomata-prior", dest="stomata_prior", action="store_false",
+                   help="Disable DINO-space stomata prior head")
+    g.add_argument("--prior-hidden-dim", type=int, default=None,
+                   help="Hidden dimension for the DINO stomata prior head")
+    g.add_argument("--prior-mode", type=str, default=None,
+                   choices=["origin", "freq_adaption"],
+                   help="Stomata prior head mode: origin=DINO-side prior head, "
+                        "freq_adaption=student-side prior head supervised by pattern teacher")
     g.add_argument("--wheat-teacher-weights", type=str, default=None,
                    help="Optional frozen wheat teacher weights for online pseudo-label generation")
     g.add_argument("--wheat-teacher-score-threshold", type=float, default=None,
@@ -118,6 +128,20 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Source feature alignment loss weight")
     g4.add_argument("--feature-align-weight-target", type=float, default=1.0,
                     help="Target feature alignment loss weight (full stage)")
+    g4.add_argument("--use-source-alignment", dest="use_source_alignment",
+                    action="store_true", default=None,
+                    help="Enable source/labeled-stream feature alignment")
+    g4.add_argument("--no-source-alignment", dest="use_source_alignment",
+                    action="store_false",
+                    help="Disable source/labeled-stream feature alignment")
+    g4.add_argument("--target-align-only", action="store_true", default=False,
+                    help="Convenience flag: disable source alignment and keep feature alignment only on the target/unlabeled stream")
+    g4.add_argument("--prior-mask-weight", type=float, default=None,
+                    help="BCE loss weight for the stomata prior head on source GT patches")
+    g4.add_argument("--prior-mask-weight-target", type=float, default=None,
+                    help="BCE loss weight for the freq_adaption student prior head on target alignment")
+    g4.add_argument("--prior-mask-pos-weight", type=float, default=None,
+                    help="Positive-class weighting for stomata prior BCE")
     g4.add_argument("--use-target-alignment", dest="use_target_alignment",
                     action="store_true", default=False,
                     help="Enable target feature alignment (only when source/target data are separate)")
@@ -143,6 +167,38 @@ def _build_parser() -> argparse.ArgumentParser:
     g4.add_argument("--align-easy-only", action="store_true", default=False,
                     help="DINO teacher sees only un-augmented images "
                          "(requires dataset images_weak support)")
+    g4.add_argument("--pattern-align", dest="pattern_align", action="store_true", default=None,
+                    help="Enable pattern-guided feature-alignment mask")
+    g4.add_argument("--no-pattern-align", dest="pattern_align", action="store_false",
+                    help="Disable pattern-guided feature-alignment mask")
+    g4.add_argument("--pattern-align-on-target", dest="pattern_align_on_target",
+                    action="store_true", default=None,
+                    help="Apply pattern-guided mask on target-alignment term")
+    g4.add_argument("--no-pattern-align-on-target", dest="pattern_align_on_target",
+                    action="store_false",
+                    help="Do not apply pattern-guided mask on target-alignment term")
+    g4.add_argument("--pattern-align-target-coverage", type=float, default=None,
+                    help="Target foreground coverage for pattern-guided mask")
+    g4.add_argument("--pattern-align-min-coverage", type=float, default=None,
+                    help="Minimum foreground coverage clamp for pattern-guided mask")
+    g4.add_argument("--pattern-align-max-coverage", type=float, default=None,
+                    help="Maximum foreground coverage clamp for pattern-guided mask")
+    g4.add_argument("--pattern-align-sim-weight", type=float, default=None,
+                    help="Weight for student-teacher similarity when building pattern mask")
+    g4.add_argument("--pattern-align-dino-weight", type=float, default=None,
+                    help="Weight for DINO activation energy when building pattern mask")
+    g4.add_argument("--pattern-align-student-weight", type=float, default=None,
+                    help="Weight for projected-student activation energy when building pattern mask")
+    g4.add_argument("--pattern-align-temperature", type=float, default=None,
+                    help="Sigmoid temperature for pattern-guided mask binarization")
+    g4.add_argument("--pattern-align-mask-floor", type=float, default=None,
+                    help="Lower bound of soft pattern-guided mask values")
+    g4.add_argument("--pattern-align-detach-mask", dest="pattern_align_detach_mask",
+                    action="store_true", default=None,
+                    help="Detach pattern-guided mask from gradient graph")
+    g4.add_argument("--no-pattern-align-detach-mask", dest="pattern_align_detach_mask",
+                    action="store_false",
+                    help="Allow gradients through pattern-guided mask construction")
     g4.add_argument(
         "--supervision-mode",
         type=str,
@@ -395,6 +451,12 @@ def args_to_config(
         m["dino_checkpoint"] = args.dino_checkpoint
     if _should_override("align_head_type"):
         m.setdefault("align_head_config", {})["head_type"] = args.align_head_type
+    if _should_override("stomata_prior") and args.stomata_prior is not None:
+        m.setdefault("prior_head_config", {})["enabled"] = bool(args.stomata_prior)
+    if _should_override("prior_hidden_dim") and args.prior_hidden_dim is not None:
+        m.setdefault("prior_head_config", {})["hidden_dim"] = int(args.prior_hidden_dim)
+    if _should_override("prior_mode") and args.prior_mode is not None:
+        m.setdefault("prior_head_config", {})["mode"] = str(args.prior_mode)
     if _should_override("wheat_teacher_weights") and args.wheat_teacher_weights:
         m["wheat_teacher_config"] = {
             "weights": args.wheat_teacher_weights,
@@ -438,6 +500,16 @@ def args_to_config(
     _set_if_override(t, "feature_align_loss_weight", args.feature_align_weight, "feature_align_weight")
     _set_if_override(t, "feature_align_loss_weight_target", args.feature_align_weight_target,
                      "feature_align_weight_target")
+    if _should_override("use_source_alignment") and args.use_source_alignment is not None:
+        t["use_source_alignment"] = bool(args.use_source_alignment)
+    if _should_override("target_align_only") and args.target_align_only:
+        t["use_source_alignment"] = False
+        t["use_target_alignment"] = True
+    _set_if_override(t, "prior_mask_loss_weight", args.prior_mask_weight, "prior_mask_weight")
+    _set_if_override(t, "prior_mask_loss_weight_target", args.prior_mask_weight_target,
+                     "prior_mask_weight_target")
+    _set_if_override(t, "prior_mask_positive_weight", args.prior_mask_pos_weight,
+                     "prior_mask_pos_weight")
     _set_if_override(t, "use_target_alignment", args.use_target_alignment, "use_target_alignment")
     _set_if_override(t, "separate_source_target_data", args.separate_source_target_data,
                      "separate_source_target_data")
@@ -445,6 +517,28 @@ def args_to_config(
     _set_if_override(t, "prediction_align_mode", args.prediction_align_mode, "prediction_align_mode")
     _set_if_override(t, "zero_pseudo_box_reg", args.zero_pseudo_box_reg, "zero_pseudo_box_reg")
     _set_if_override(t, "align_easy_only", args.align_easy_only, "align_easy_only")
+    if _should_override("pattern_align") and args.pattern_align is not None:
+        t["pattern_align_enabled"] = bool(args.pattern_align)
+    if _should_override("pattern_align_on_target") and args.pattern_align_on_target is not None:
+        t["pattern_align_on_target"] = bool(args.pattern_align_on_target)
+    if _should_override("pattern_align_target_coverage") and args.pattern_align_target_coverage is not None:
+        t["pattern_align_target_coverage"] = float(args.pattern_align_target_coverage)
+    if _should_override("pattern_align_min_coverage") and args.pattern_align_min_coverage is not None:
+        t["pattern_align_min_coverage"] = float(args.pattern_align_min_coverage)
+    if _should_override("pattern_align_max_coverage") and args.pattern_align_max_coverage is not None:
+        t["pattern_align_max_coverage"] = float(args.pattern_align_max_coverage)
+    if _should_override("pattern_align_sim_weight") and args.pattern_align_sim_weight is not None:
+        t["pattern_align_sim_weight"] = float(args.pattern_align_sim_weight)
+    if _should_override("pattern_align_dino_weight") and args.pattern_align_dino_weight is not None:
+        t["pattern_align_dino_weight"] = float(args.pattern_align_dino_weight)
+    if _should_override("pattern_align_student_weight") and args.pattern_align_student_weight is not None:
+        t["pattern_align_student_weight"] = float(args.pattern_align_student_weight)
+    if _should_override("pattern_align_temperature") and args.pattern_align_temperature is not None:
+        t["pattern_align_temperature"] = float(args.pattern_align_temperature)
+    if _should_override("pattern_align_mask_floor") and args.pattern_align_mask_floor is not None:
+        t["pattern_align_mask_floor"] = float(args.pattern_align_mask_floor)
+    if _should_override("pattern_align_detach_mask") and args.pattern_align_detach_mask is not None:
+        t["pattern_align_detach_mask"] = bool(args.pattern_align_detach_mask)
     _set_if_override(t, "supervision_mode", args.supervision_mode, "supervision_mode")
 
     # ---- pseudo labels ----
@@ -576,8 +670,16 @@ def main():
         f"(decay={config['training'].get('ema_decay', 0.9999)}, "
         f"tau={config['training'].get('ema_tau', 2000.0)})"
     )
-    print("  Source align  : epoch 0+")
-    print(f"  Target align  : epoch {config['training']['align_target_start_epoch']}+")
+    source_align_enabled = bool(config["training"].get("use_source_alignment", True))
+    target_align_enabled = bool(config["training"].get("use_target_alignment", False))
+    if source_align_enabled:
+        print("  Source align  : epoch 0+")
+    else:
+        print("  Source align  : disabled")
+    if target_align_enabled:
+        print(f"  Target align  : epoch {config['training']['align_target_start_epoch']}+")
+    else:
+        print("  Target align  : disabled")
     if int(config['training'].get('burn_up_epochs', 0) or 0) > 0:
         print("  Note          : burn_up_epochs is deprecated and ignored")
     print(f"  Dual-stream   : {config['training'].get('separate_source_target_data', False)}")
@@ -592,7 +694,17 @@ def main():
             f"{config['data'].get('unlabeled_dataset_root', config['data'].get('dataset_root'))}"
             f"/{config['data'].get('unlabeled_image_subdir', '')}"
         )
-    print(f"  Use target-align term: {config['training'].get('use_target_alignment', True)}")
+    print(f"  Use source-align term: {source_align_enabled}")
+    print(f"  Use target-align term: {target_align_enabled}")
+    print(
+        f"  Pattern align : {config['training'].get('pattern_align_enabled', True)} "
+        f"(target={config['training'].get('pattern_align_on_target', True)})"
+    )
+    prior_cfg = config["model"].get("prior_head_config", {}) or {}
+    print(
+        f"  Prior head    : enabled={prior_cfg.get('enabled', False)} "
+        f"mode={prior_cfg.get('mode', 'origin')}"
+    )
     print(f"  DINO ckpt     : {config['model'].get('dino_checkpoint', 'None')}")
     wheat_cfg = config["model"].get("wheat_teacher_config") or {}
     print(

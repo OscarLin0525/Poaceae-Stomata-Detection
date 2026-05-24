@@ -40,6 +40,15 @@ if str(_DINOV3_ROOT) not in sys.path:
     sys.path.insert(0, str(_DINOV3_ROOT))
 
 
+def _load_weights(path: str) -> Dict[str, torch.Tensor]:
+    """Load trusted local DINO weights without triggering PyTorch pickle warning."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # Older PyTorch versions do not support weights_only yet.
+        return torch.load(path, map_location="cpu")
+
+
 class _DinoPreprocessing:
     """ImageNet normalisation (pixel values in [0, 255])."""
 
@@ -128,7 +137,7 @@ class DinoFeatureExtractor(nn.Module):
             if model_name in _v3_map:
                 model = _v3_map[model_name](patch_size=patch_size)
                 if pretrained_path and os.path.isfile(pretrained_path):
-                    state = torch.load(pretrained_path, map_location="cpu")
+                    state = _load_weights(pretrained_path)
                     if "model" in state:
                         state = state["model"]
                     model.load_state_dict(state, strict=False)
@@ -153,7 +162,7 @@ class DinoFeatureExtractor(nn.Module):
                 model = _v2_map[model_name](pretrained=False)
                 if pretrained_path and os.path.isfile(pretrained_path):
                     model.load_state_dict(
-                        torch.load(pretrained_path, map_location="cpu"),
+                        _load_weights(pretrained_path),
                         strict=False,
                     )
                 return model

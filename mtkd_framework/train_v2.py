@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+import json
+import math
 import logging
 import os
 import shutil
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -44,7 +47,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
+
+import matplotlib
 
 from .models.mtkd_model_v2 import MTKDModelV2, build_mtkd_model_v2
 from .engine.pseudo_labels import (
@@ -92,6 +99,11 @@ def get_default_config_v2() -> Dict[str, Any]:
                 "weights": "yolo12s.pt",
                 "feature_level": "p4",
             },
+            "student_freeze_config": {
+                "enabled": False,
+                "trainable_layer_indices": [17, 18, 20, 21],
+                "trainable_name_keywords": [],
+            },
             "dino_config": {
                 "model_name": "vit_base",
                 "patch_size": 16,
@@ -105,6 +117,17 @@ def get_default_config_v2() -> Dict[str, Any]:
                 "proj_dim": 1024,
                 "normalize": True,
                 "use_gelu": False,
+            },
+            "prior_head_config": {
+                "enabled": True,
+                "mode": "origin",
+                "hidden_dim": 256,
+                "use_gelu": True,
+                "detach_for_align": True,
+                "apply_to_detection": False,
+                "gate_strength": 1.0,
+                "gate_hard": False,
+                "gate_threshold": 0.5,
             },
             "student_align_layer": "p4",      # which YOLO pyramid level to align
             # MTKD no longer injects FFT blocks into DINO.
@@ -131,14 +154,22 @@ def get_default_config_v2() -> Dict[str, Any]:
             "early_stopping_patience": 20,
             "ema_enabled": True,
             "ema_decay": 0.9999,
-            "ema_tau": 2000.0,
+            "ema_tau": 0.0,
             # ---- 2-stage schedule ----
             # Kept for backward compatibility only; ignored by trainer.
             "burn_up_epochs": 0,
             "align_target_start_epoch": 10,    # add target alignment + pseudo-labels after this
             # ---- loss weights (mirrors DINO Teacher) ----
             "feature_align_loss_weight": 1.0,
-            "feature_align_loss_weight_target": 1.0,
+            "feature_align_loss_weight_target": 0.2,
+            "use_source_alignment": True,
+            "prior_mask_loss_weight": 1.0,
+            "prior_mask_loss_weight_target": 1.0,
+            "prior_mask_positive_weight": 4.0,
+            "prior_propagation_loss_weight": 0.35,
+            "prior_periodic_loss_weight": 0.40,
+            "prior_periodic_row_weight": 0.35,
+            "prior_periodic_col_weight": 1.00,
             # In single-dataset MTKD (no explicit source/target split), a
             # second target alignment term duplicates pressure on the same
             # mini-batch. Keep it disabled unless separate source/target data
@@ -159,6 +190,43 @@ def get_default_config_v2() -> Dict[str, Any]:
             # second, unaugmented copy).  If False or the key is absent,
             # the same augmented images are sent to both student and teacher.
             "align_easy_only": False,
+            # Pattern-guided alignment mask (in DINO patch space).
+            "pattern_align_enabled": True,
+            "pattern_align_on_target": True,
+            "pattern_align_target_coverage": 0.12,
+            "pattern_align_min_coverage": 0.02,
+            "pattern_align_max_coverage": 0.30,
+            "pattern_align_mode": "legacy",
+            "pattern_align_pca_components": 3,
+            "pattern_align_hybrid_pca_weight": 0.5,
+            "pattern_align_filtered_prior_strength": 0.75,
+            "pattern_align_filtered_completion_strength": 0.65,
+            "pattern_align_filtered_completion_gamma": 1.0,
+            "pattern_align_filtered_noise_suppress": 0.25,
+            "pattern_align_sim_weight": 0.55,
+            "pattern_align_dino_weight": 0.30,
+            "pattern_align_student_weight": 0.15,
+            "pattern_align_species_prior_bank": None,
+            "pattern_align_source_prior_name": None,
+            "pattern_align_target_prior_name": None,
+            "pattern_align_structural_prior_strength": 0.0,
+            "pattern_align_structural_cross_row_strength": 0.0,
+            "pattern_align_structural_seed_threshold": 0.55,
+            "pattern_align_structural_min_row_seeds": 2,
+            "pattern_align_temperature": 0.08,
+            "pattern_align_mask_floor": 0.10,
+            "pattern_align_hard_mask": False,
+            "pattern_align_hard_mask_threshold": 0.5,
+            "pattern_align_detach_mask": True,
+            "pattern_align_use_dino_bypass": False,
+            "student_gate_distill_enabled": False,
+            "student_gate_distill_weight": 0.10,
+            "student_gate_distill_bce_weight": 0.70,
+            "student_gate_distill_mse_weight": 0.30,
+            "student_gate_distill_positive_weight": 3.0,
+            "pseudo_hard_mask_gate_enabled": False,
+            "weight_anchor_enabled": False,
+            "weight_anchor_lambda": 0.0,
         },
         # ---- pseudo labels ----
         "pseudo_labels": {
@@ -225,11 +293,191 @@ def get_default_config_v2() -> Dict[str, Any]:
             "map_conf": None,
             "map_iou": None,
             "map_eval_interval": 1,
+            "debug_export_interval": 0,
+            "debug_tile_size": 320,
+            "debug_pred_conf": 0.10,
+            "debug_pred_max_boxes": 300,
         },
         # ---- misc ----
         "seed": 42,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
+
+
+def _candidate_component_score_stems(image_path: str) -> List[str]:
+    stem = Path(image_path).stem
+    candidates: List[str] = [stem]
+    if stem.startswith("result_"):
+        candidates.append(stem[len("result_") :])
+    candidates.append(stem.removeprefix("result_"))
+    unique: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _estimate_spacing_px(xs: np.ndarray) -> float:
+    xs = np.sort(xs.astype(np.float32))
+    if xs.size < 2:
+        return 0.0
+    diffs = np.diff(xs)
+    diffs = diffs[diffs > 1.0]
+    if diffs.size == 0:
+        return 0.0
+    rough = float(np.median(diffs))
+    keep = diffs[(diffs >= 0.45 * rough) & (diffs <= 1.65 * rough)]
+    if keep.size:
+        return float(np.median(keep))
+    return rough
+
+
+def _load_image_prior_index(path: Optional[Path]) -> Dict[str, Dict[str, object]]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    images = data.get("images", [])
+    if not isinstance(images, list):
+        return {}
+    index: Dict[str, Dict[str, object]] = {}
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        image_name = str(item.get("image") or Path(str(item.get("annotated_image", ""))).name)
+        if not image_name:
+            continue
+        for stem in _candidate_component_score_stems(image_name):
+            index[stem] = item
+    return index
+
+
+def _load_species_prior_bank(path: Optional[Path]) -> Dict[str, Dict[str, float]]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    priors = data.get("priors", [])
+    if not isinstance(priors, list):
+        return {}
+    bank: Dict[str, Dict[str, float]] = {}
+    for item in priors:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        bank[name] = {
+            "image_width": float(item.get("image_width", 0.0) or 0.0),
+            "image_height": float(item.get("image_height", 0.0) or 0.0),
+            "x_period_px": float(item.get("x_period_px", 0.0) or 0.0),
+            "row_period_px": float(item.get("row_period_px", 0.0) or 0.0),
+        }
+    return bank
+
+
+def _infer_species_prior_name(
+    image_path: str,
+    *,
+    image_size: tuple[int, int],
+    bank: Dict[str, Dict[str, float]],
+) -> Optional[str]:
+    if not bank:
+        return None
+    text = image_path.lower()
+    stem = Path(image_path).stem.lower()
+    if "rice" in text or stem.startswith("202112"):
+        return "rice_annotate" if "rice_annotate" in bank else None
+    if "wheat" in text or "tl" in stem:
+        return "wheat10_label" if "wheat10_label" in bank else None
+    if "barley" in text or stem.startswith("202408"):
+        return "barley20_label" if "barley20_label" in bank else None
+
+    img_w, img_h = float(image_size[0]), float(image_size[1])
+    best_name: Optional[str] = None
+    best_score = float("inf")
+    for name, prior in bank.items():
+        dw = abs(float(prior.get("image_width", 0.0)) - img_w)
+        dh = abs(float(prior.get("image_height", 0.0)) - img_h)
+        score = dw + dh
+        if score < best_score:
+            best_score = score
+            best_name = name
+    return best_name
+
+
+def _resolve_external_pattern_prior(
+    image_path: str,
+    *,
+    image_size: tuple[int, int],
+    image_prior_index: Dict[str, Dict[str, object]],
+    species_prior_bank: Dict[str, Dict[str, float]],
+) -> Dict[str, object]:
+    resolved: Dict[str, object] = {
+        "source": "none",
+        "family": "",
+        "x_period_px": 0.0,
+        "row_period_px": 0.0,
+        "row_tolerance_px": 0.0,
+        "row_centers_px": [],
+    }
+    for stem in _candidate_component_score_stems(image_path):
+        item = image_prior_index.get(stem)
+        if not isinstance(item, dict):
+            continue
+        rows = item.get("rows", [])
+        if not isinstance(rows, list):
+            rows = []
+        good_rows = [
+            row for row in rows
+            if isinstance(row, dict) and float(row.get("count", 0.0) or 0.0) >= 3.0
+        ]
+        periods = [
+            float(row.get("x_period_median_gap", 0.0) or 0.0)
+            for row in good_rows
+            if float(row.get("x_period_median_gap", 0.0) or 0.0) > 3.0
+        ]
+        row_centers = [
+            float(row.get("row_y", 0.0) or 0.0)
+            for row in rows
+            if isinstance(row, dict) and float(row.get("count", 0.0) or 0.0) >= 2.0
+        ]
+        row_centers = sorted(y for y in row_centers if y >= 0.0)
+        row_gap = float(item.get("row_gap_median", 0.0) or 0.0)
+        resolved.update(
+            {
+                "source": "image_priors",
+                "family": "rice_annotate",
+                "x_period_px": float(np.median(periods)) if periods else 0.0,
+                "row_period_px": row_gap if row_gap > 0.0 else _estimate_spacing_px(np.asarray(row_centers, dtype=np.float32)),
+                "row_tolerance_px": float(item.get("row_tolerance_px", 0.0) or 0.0),
+                "row_centers_px": row_centers,
+            }
+        )
+        return resolved
+
+    prior_name = _infer_species_prior_name(image_path, image_size=image_size, bank=species_prior_bank)
+    if prior_name and prior_name in species_prior_bank:
+        prior = species_prior_bank[prior_name]
+        resolved.update(
+            {
+                "source": "species_prior_bank",
+                "family": prior_name,
+                "x_period_px": float(prior.get("x_period_px", 0.0) or 0.0),
+                "row_period_px": float(prior.get("row_period_px", 0.0) or 0.0),
+                "row_tolerance_px": max(float(prior.get("row_period_px", 0.0) or 0.0) * 0.22, 18.0),
+                "row_centers_px": [],
+            }
+        )
+    return resolved
 
 
 # ======================================================================
@@ -285,6 +533,9 @@ class MTKDTrainerV2:
             f"Student task: {self.student_task} | target box dim: {self.student_box_dim}"
         )
         self.num_classes = int(config.get("model", {}).get("num_classes", 1))
+        self.weight_anchor_enabled = False
+        self.weight_anchor_lambda = 0.0
+        self._student_anchor_params: Dict[str, torch.Tensor] = {}
 
         # ---- data ----
         self.train_loader = train_loader
@@ -297,6 +548,8 @@ class MTKDTrainerV2:
         # ---- AMP ----
         self.scaler = None
         tc = config["training"]
+        self.weight_anchor_enabled = bool(tc.get("weight_anchor_enabled", False))
+        self.weight_anchor_lambda = float(tc.get("weight_anchor_lambda", 0.0))
         self.dual_stream = bool(tc.get("separate_source_target_data", False))
         if self.dual_stream:
             self.logger.info(
@@ -323,8 +576,16 @@ class MTKDTrainerV2:
             )
 
         # ---- loss weights ----
-        self.feature_align_w = tc.get("feature_align_loss_weight", 1.0)
-        self.feature_align_w_target = tc.get("feature_align_loss_weight_target", 1.0)
+        self.feature_align_w = tc.get("feature_align_loss_weight", 0.0)
+        self.feature_align_w_target = tc.get("feature_align_loss_weight_target", 0.0)
+        self.use_source_alignment = bool(tc.get("use_source_alignment", True))
+        self.prior_mask_loss_w = float(tc.get("prior_mask_loss_weight", 1.0))
+        self.prior_mask_loss_w_target = float(tc.get("prior_mask_loss_weight_target", 1.0))
+        self.prior_mask_pos_w = float(tc.get("prior_mask_positive_weight", 4.0))
+        self.prior_propagation_loss_w = float(tc.get("prior_propagation_loss_weight", 0.35))
+        self.prior_periodic_loss_w = float(tc.get("prior_periodic_loss_weight", 0.40))
+        self.prior_periodic_row_w = float(tc.get("prior_periodic_row_weight", 0.35))
+        self.prior_periodic_col_w = float(tc.get("prior_periodic_col_weight", 1.00))
         self.use_target_alignment = bool(tc.get("use_target_alignment", False))
         self.separate_source_target_data = bool(tc.get("separate_source_target_data", False))
         self.unsup_loss_w = tc.get("unsup_loss_weight", 4.0)
@@ -339,6 +600,72 @@ class MTKDTrainerV2:
         )
         self.zero_pseudo_box_reg = tc.get("zero_pseudo_box_reg", False)
         self.align_easy_only = tc.get("align_easy_only", False)
+        self.pattern_align_enabled = bool(tc.get("pattern_align_enabled", True))
+        self.pattern_align_on_target = bool(tc.get("pattern_align_on_target", True))
+        self.pattern_align_target_coverage = float(tc.get("pattern_align_target_coverage", 0.12))
+        self.pattern_align_min_coverage = float(tc.get("pattern_align_min_coverage", 0.02))
+        self.pattern_align_max_coverage = float(tc.get("pattern_align_max_coverage", 0.30))
+        self.pattern_align_mode = str(tc.get("pattern_align_mode", "legacy")).strip().lower()
+        if self.pattern_align_mode not in {"legacy", "pca_prior", "hybrid", "filtered_support"}:
+            raise ValueError(
+                "training.pattern_align_mode must be one of: legacy / pca_prior / hybrid / filtered_support"
+            )
+        self.pattern_align_pca_components = int(tc.get("pattern_align_pca_components", 3))
+        self.pattern_align_hybrid_pca_weight = float(tc.get("pattern_align_hybrid_pca_weight", 0.5))
+        self.pattern_align_filtered_prior_strength = float(tc.get("pattern_align_filtered_prior_strength", 0.75))
+        self.pattern_align_filtered_completion_strength = float(tc.get("pattern_align_filtered_completion_strength", 0.65))
+        self.pattern_align_filtered_completion_gamma = float(tc.get("pattern_align_filtered_completion_gamma", 1.0))
+        self.pattern_align_filtered_noise_suppress = float(tc.get("pattern_align_filtered_noise_suppress", 0.25))
+        self.pattern_align_sim_weight = float(tc.get("pattern_align_sim_weight", 0.55))
+        self.pattern_align_dino_weight = float(tc.get("pattern_align_dino_weight", 0.30))
+        self.pattern_align_student_weight = float(tc.get("pattern_align_student_weight", 0.15))
+        self.pattern_align_species_prior_bank = tc.get("pattern_align_species_prior_bank", None)
+        self.pattern_align_source_prior_name = tc.get("pattern_align_source_prior_name", None)
+        self.pattern_align_target_prior_name = tc.get("pattern_align_target_prior_name", None)
+        self.pattern_align_structural_prior_strength = float(tc.get("pattern_align_structural_prior_strength", 0.0))
+        self.pattern_align_structural_cross_row_strength = float(tc.get("pattern_align_structural_cross_row_strength", 0.0))
+        self.pattern_align_structural_seed_threshold = float(tc.get("pattern_align_structural_seed_threshold", 0.55))
+        self.pattern_align_structural_min_row_seeds = int(tc.get("pattern_align_structural_min_row_seeds", 2))
+        self.pattern_align_temperature = float(tc.get("pattern_align_temperature", 0.08))
+        self.pattern_align_mask_floor = float(tc.get("pattern_align_mask_floor", 0.10))
+        self.pattern_align_hard_mask = bool(tc.get("pattern_align_hard_mask", False))
+        self.pattern_align_hard_mask_threshold = float(tc.get("pattern_align_hard_mask_threshold", 0.5))
+        self.pattern_align_detach_mask = bool(tc.get("pattern_align_detach_mask", True))
+        self.pattern_align_use_dino_bypass = bool(tc.get("pattern_align_use_dino_bypass", False))
+        self.student_gate_distill_enabled = bool(tc.get("student_gate_distill_enabled", False))
+        self.student_gate_distill_w = float(tc.get("student_gate_distill_weight", 0.10))
+        self.student_gate_distill_bce_w = float(tc.get("student_gate_distill_bce_weight", 0.70))
+        self.student_gate_distill_mse_w = float(tc.get("student_gate_distill_mse_weight", 0.30))
+        self.student_gate_distill_pos_w = float(tc.get("student_gate_distill_positive_weight", 3.0))
+        self.pseudo_hard_mask_gate_enabled = bool(tc.get("pseudo_hard_mask_gate_enabled", False))
+        self.pattern_align_source_prior_cfg = self._resolve_pattern_spacing_prior(self.pattern_align_source_prior_name)
+        self.pattern_align_target_prior_cfg = self._resolve_pattern_spacing_prior(self.pattern_align_target_prior_name)
+        self._dino_bypass_cfg = dict(self.config.get("dino_bypass", {}) or {})
+        self._dino_bypass_image_prior_index: Dict[str, Dict[str, object]] = {}
+        self._dino_bypass_species_prior_bank: Dict[str, Dict[str, float]] = {}
+        self._dino_bypass_period_prior_px = float(self._dino_bypass_cfg.get("pattern_period_prior_px", 0.0) or 0.0)
+        self._dino_bypass_row_period_prior_px = float(self._dino_bypass_cfg.get("pattern_row_period_prior_px", 0.0) or 0.0)
+        self._dino_bypass_row_tolerance_override_px = float(
+            self._dino_bypass_cfg.get("pattern_row_tolerance_override_px", 0.0) or 0.0
+        )
+        self._dino_bypass_row_tolerance_scale = float(
+            self._dino_bypass_cfg.get("pattern_row_tolerance_scale", 0.0) or 0.0
+        )
+        if self.pattern_align_use_dino_bypass:
+            prior_path = self._dino_bypass_cfg.get("pattern_image_priors")
+            if prior_path:
+                self._dino_bypass_image_prior_index = _load_image_prior_index(
+                    Path(str(prior_path)).expanduser().resolve()
+                )
+            species_path = self._dino_bypass_cfg.get("pattern_species_prior_bank") or self.pattern_align_species_prior_bank
+            if species_path:
+                self._dino_bypass_species_prior_bank = _load_species_prior_bank(
+                    Path(str(species_path)).expanduser().resolve()
+                )
+            if not self._dino_bypass_image_prior_index and not self._dino_bypass_species_prior_bank:
+                self.logger.warning(
+                    "pattern_align_use_dino_bypass enabled but no image/species prior bank found; using static ratios"
+                )
         if self.use_target_alignment and not self.separate_source_target_data:
             self.logger.warning(
                 "use_target_alignment=True but separate_source_target_data=False; "
@@ -346,9 +673,29 @@ class MTKDTrainerV2:
             )
             self.use_target_alignment = False
         self.logger.info(
+            "Source alignment term: %s",
+            "enabled" if self.use_source_alignment else "disabled",
+        )
+        self.logger.info(
             "Target alignment term: %s",
             "enabled" if self.use_target_alignment else "disabled",
         )
+        prior_mode = str(getattr(self.model, "prior_head_mode", "origin"))
+        if (
+            not self.use_source_alignment
+            and getattr(self.model, "use_stomata_prior", False)
+            and prior_mode == "origin"
+        ):
+            self.logger.info(
+                "Stomata prior head is source-align-only in the current implementation; "
+                "it will stay inactive while source alignment is disabled."
+            )
+        elif getattr(self.model, "use_stomata_prior", False):
+            self.logger.info("Stomata prior head mode: %s", prior_mode)
+        if not self.use_source_alignment and not self.use_target_alignment:
+            self.logger.warning(
+                "Both source and target alignment are disabled; training will run without feature alignment."
+            )
         if self.zero_pseudo_box_reg:
             self.logger.info("Pseudo box regression: disabled (cls-only pseudo supervision)")
         else:
@@ -357,6 +704,34 @@ class MTKDTrainerV2:
             self.logger.info("Prediction alignment: Ultralytics criterion/assigner path")
         else:
             self.logger.info("Prediction alignment: legacy direct pseudo criterion path")
+        self.logger.info(
+            "Pattern-guided alignment mask: %s (target=%s, mode=%s, cov=%.3f, floor=%.3f)",
+            "enabled" if self.pattern_align_enabled else "disabled",
+            "enabled" if self.pattern_align_on_target else "disabled",
+            self.pattern_align_mode,
+            self.pattern_align_target_coverage,
+            self.pattern_align_mask_floor,
+        )
+        if self.pattern_align_use_dino_bypass:
+            self.logger.info(
+                "Pattern align uses dino_bypass priors (image_priors=%s, species_prior=%s)",
+                "yes" if self._dino_bypass_image_prior_index else "no",
+                "yes" if self._dino_bypass_species_prior_bank else "no",
+            )
+        if self.pseudo_hard_mask_gate_enabled:
+            self.logger.info(
+                "Pseudo hard-mask gate: enabled (mode=%s, threshold=%.3f)",
+                self.pattern_align_mode,
+                self.pattern_align_hard_mask_threshold,
+            )
+        if self.student_gate_distill_enabled:
+            self.logger.info(
+                "Student support-gate distillation: enabled weight=%.4f bce=%.2f mse=%.2f pos_weight=%.2f",
+                self.student_gate_distill_w,
+                self.student_gate_distill_bce_w,
+                self.student_gate_distill_mse_w,
+                self.student_gate_distill_pos_w,
+            )
         self.supervision_mode = str(tc.get("supervision_mode", "gt+pseudo")).lower()
         if self.supervision_mode not in {"gt+pseudo", "gt-only", "pseudo-only"}:
             raise ValueError(
@@ -371,6 +746,19 @@ class MTKDTrainerV2:
             f"Supervision mode: {self.supervision_mode} "
             f"(use_gt={self.use_gt_supervision}, use_pseudo={self.use_pseudo_supervision})"
         )
+        if self.weight_anchor_enabled and self.weight_anchor_lambda > 0.0:
+            self._student_anchor_params = {
+                name: param.detach().clone()
+                for name, param in self.model.student.named_parameters()
+                if param.requires_grad
+            }
+            self.logger.info(
+                "Weight anchoring (L2-SP): enabled lambda=%.6f on %d student tensors",
+                self.weight_anchor_lambda,
+                len(self._student_anchor_params),
+            )
+        else:
+            self.weight_anchor_enabled = False
         if self.supervision_mode == "pseudo-only":
             self.logger.info(
                 "Pseudo supervision starts at epoch %d",
@@ -547,6 +935,12 @@ class MTKDTrainerV2:
         self.save_freq = max(0, int(oc.get("save_freq", 5)))
         self.save_pth_checkpoints = bool(oc.get("save_pth_checkpoints", True))
         self.map_eval_interval = max(1, int(oc.get("map_eval_interval", 1)))
+        self.debug_export_interval = max(0, int(oc.get("debug_export_interval", 0)))
+        self.debug_tile_size = max(128, int(oc.get("debug_tile_size", 320)))
+        self.debug_pred_conf = float(oc.get("debug_pred_conf", 0.10))
+        self.debug_pred_max_boxes = max(1, int(oc.get("debug_pred_max_boxes", 300)))
+        self.debug_dir = os.path.join(config["output"]["save_dir"], "debug_exports")
+        os.makedirs(self.debug_dir, exist_ok=True)
 
         if self.best_by != "loss" and not self.map_data:
             raise ValueError(
@@ -565,6 +959,12 @@ class MTKDTrainerV2:
                 self.logger.info("PyTorch checkpoints: best-only (.pth periodic disabled)")
         else:
             self.logger.info("PyTorch checkpoints: disabled (.pth suppressed, student_best.pt only)")
+        if self.debug_export_interval > 0:
+            self.logger.info(
+                "Debug exports: every %d epochs -> %s",
+                self.debug_export_interval,
+                self.debug_dir,
+            )
         resume_path = config.get("checkpoints", {}).get("resume")
         if resume_path:
             self._load_checkpoint(resume_path)
@@ -1009,6 +1409,219 @@ class MTKDTrainerV2:
             parts.append(f"area_relabel={metrics.get('pseudo_area_relabel_count', 0.0):.1f}")
         return ", ".join(parts)
 
+    def _resolve_pattern_spacing_prior(self, prior_name: Optional[str]) -> Dict[str, float]:
+        empty = {
+            "period_ratio_x": 0.0,
+            "row_period_ratio_y": 0.0,
+            "row_tolerance_ratio_y": 0.0,
+        }
+        name = str(prior_name or "").strip()
+        bank_path_raw = self.pattern_align_species_prior_bank
+        if not name or not bank_path_raw:
+            return empty
+
+        bank_path = Path(str(bank_path_raw)).expanduser().resolve()
+        if not bank_path.is_file():
+            self.logger.warning("pattern_align_species_prior_bank not found: %s", bank_path)
+            return empty
+
+        try:
+            with bank_path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            self.logger.warning("Failed to load pattern spacing prior bank %s: %s", bank_path, exc)
+            return empty
+
+        priors = payload.get("priors", []) if isinstance(payload, dict) else []
+        for item in priors:
+            if str(item.get("name", "")).strip() != name:
+                continue
+            try:
+                img_w = float(item.get("image_width", 0.0) or 0.0)
+                img_h = float(item.get("image_height", 0.0) or 0.0)
+                period_px = float(
+                    item.get("x_period_px", item.get("horizontal_period_px", item.get("period_px", 0.0))) or 0.0
+                )
+                row_period_px = float(
+                    item.get("row_period_px", item.get("y_period_px", item.get("vertical_period_px", 0.0))) or 0.0
+                )
+                row_tol_px = float(item.get("row_tolerance_px", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                self.logger.warning("Invalid spacing prior entry for %s in %s", name, bank_path)
+                return empty
+
+            if row_tol_px <= 0.0 and row_period_px > 0.0 and img_h > 0.0:
+                row_tol_px = max(row_period_px * 0.22, 18.0)
+
+            resolved = {
+                "period_ratio_x": period_px / img_w if img_w > 0.0 else 0.0,
+                "row_period_ratio_y": row_period_px / img_h if img_h > 0.0 else 0.0,
+                "row_tolerance_ratio_y": row_tol_px / img_h if img_h > 0.0 else 0.0,
+            }
+            self.logger.info(
+                "Loaded pattern spacing prior '%s' from %s | x_period_ratio=%.4f row_period_ratio=%.4f row_tol_ratio=%.4f",
+                name,
+                bank_path,
+                resolved["period_ratio_x"],
+                resolved["row_period_ratio_y"],
+                resolved["row_tolerance_ratio_y"],
+            )
+            return resolved
+
+        self.logger.warning("pattern spacing prior named %r not found in %s", name, bank_path)
+        return empty
+
+    @staticmethod
+    def _aggregate_pattern_stats(stats_list: Sequence[Dict[str, float]]) -> Dict[str, float]:
+        if not stats_list:
+            return {}
+        keys = {key for stats in stats_list for key in stats.keys()}
+        aggregated: Dict[str, float] = {}
+        for key in keys:
+            values = [float(stats.get(key, 0.0) or 0.0) for stats in stats_list]
+            aggregated[key] = float(np.mean(values)) if values else 0.0
+        return aggregated
+
+    def _resolve_bypass_ratios_for_batch(
+        self,
+        image_paths: Sequence[str],
+        images: torch.Tensor,
+        default_cfg: Dict[str, float],
+    ) -> Optional[List[Dict[str, float]]]:
+        if not self.pattern_align_use_dino_bypass:
+            return None
+        if not image_paths or images is None:
+            return None
+        if images.ndim < 4:
+            return None
+        if (
+            not self._dino_bypass_image_prior_index
+            and not self._dino_bypass_species_prior_bank
+            and self._dino_bypass_period_prior_px <= 0.0
+            and self._dino_bypass_row_period_prior_px <= 0.0
+            and self._dino_bypass_row_tolerance_override_px <= 0.0
+        ):
+            return None
+
+        img_w = float(images.shape[-1])
+        img_h = float(images.shape[-2])
+        ratios: List[Dict[str, float]] = []
+        for path in image_paths:
+            prior = _resolve_external_pattern_prior(
+                path,
+                image_size=(img_w, img_h),
+                image_prior_index=self._dino_bypass_image_prior_index,
+                species_prior_bank=self._dino_bypass_species_prior_bank,
+            )
+            period_px = float(prior.get("x_period_px", 0.0) or 0.0)
+            row_period_px = float(prior.get("row_period_px", 0.0) or 0.0)
+            row_tol_px = float(prior.get("row_tolerance_px", 0.0) or 0.0)
+            if self._dino_bypass_period_prior_px > 0.0:
+                period_px = self._dino_bypass_period_prior_px
+            if self._dino_bypass_row_period_prior_px > 0.0:
+                row_period_px = self._dino_bypass_row_period_prior_px
+            if self._dino_bypass_row_tolerance_override_px > 0.0:
+                row_tol_px = self._dino_bypass_row_tolerance_override_px
+            if row_tol_px <= 0.0 and row_period_px > 0.0:
+                if self._dino_bypass_row_tolerance_scale > 0.0:
+                    row_tol_px = row_period_px * self._dino_bypass_row_tolerance_scale
+                else:
+                    row_tol_px = max(row_period_px * 0.22, 18.0)
+
+            ratios.append(
+                {
+                    "period_ratio_x": period_px / img_w if period_px > 0.0 else default_cfg.get("period_ratio_x", 0.0),
+                    "row_period_ratio_y": row_period_px / img_h if row_period_px > 0.0 else default_cfg.get("row_period_ratio_y", 0.0),
+                    "row_tolerance_ratio_y": row_tol_px / img_h if row_tol_px > 0.0 else default_cfg.get("row_tolerance_ratio_y", 0.0),
+                }
+            )
+        return ratios
+
+    def _build_pattern_align_mask_for_batch(
+        self,
+        student_feat: torch.Tensor,
+        dino_feat: torch.Tensor,
+        image_paths: Sequence[str],
+        images: torch.Tensor,
+        default_prior_cfg: Dict[str, float],
+        *,
+        use_bypass: bool,
+        hard_mask: bool,
+        hard_mask_threshold: float,
+        detach: bool,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        if not self.pattern_align_enabled or not hasattr(self.model, "build_pattern_align_mask"):
+            return None, {}
+
+        ratios = self._resolve_bypass_ratios_for_batch(image_paths, images, default_prior_cfg) if use_bypass else None
+        if ratios and len(ratios) == int(student_feat.shape[0]):
+            masks: List[torch.Tensor] = []
+            stats_list: List[Dict[str, float]] = []
+            for idx, ratio in enumerate(ratios):
+                mask, stats = self.model.build_pattern_align_mask(
+                    student_feat[idx : idx + 1],
+                    dino_feat[idx : idx + 1],
+                    target_coverage=self.pattern_align_target_coverage,
+                    min_coverage=self.pattern_align_min_coverage,
+                    max_coverage=self.pattern_align_max_coverage,
+                    mode=self.pattern_align_mode,
+                    pca_components=self.pattern_align_pca_components,
+                    hybrid_pca_weight=self.pattern_align_hybrid_pca_weight,
+                    filtered_prior_strength=self.pattern_align_filtered_prior_strength,
+                    filtered_completion_strength=self.pattern_align_filtered_completion_strength,
+                    filtered_completion_gamma=self.pattern_align_filtered_completion_gamma,
+                    filtered_noise_suppress=self.pattern_align_filtered_noise_suppress,
+                    sim_weight=self.pattern_align_sim_weight,
+                    dino_weight=self.pattern_align_dino_weight,
+                    student_weight=self.pattern_align_student_weight,
+                    period_ratio_x=ratio["period_ratio_x"],
+                    row_period_ratio_y=ratio["row_period_ratio_y"],
+                    row_tolerance_ratio_y=ratio["row_tolerance_ratio_y"],
+                    structural_prior_strength=self.pattern_align_structural_prior_strength,
+                    structural_cross_row_strength=self.pattern_align_structural_cross_row_strength,
+                    structural_seed_threshold=self.pattern_align_structural_seed_threshold,
+                    structural_min_row_seeds=self.pattern_align_structural_min_row_seeds,
+                    temperature=self.pattern_align_temperature,
+                    mask_floor=self.pattern_align_mask_floor,
+                    hard_mask=hard_mask,
+                    hard_mask_threshold=hard_mask_threshold,
+                    detach=detach,
+                )
+                masks.append(mask)
+                stats_list.append(stats)
+            return torch.cat(masks, dim=0), self._aggregate_pattern_stats(stats_list)
+
+        mask, stats = self.model.build_pattern_align_mask(
+            student_feat,
+            dino_feat,
+            target_coverage=self.pattern_align_target_coverage,
+            min_coverage=self.pattern_align_min_coverage,
+            max_coverage=self.pattern_align_max_coverage,
+            mode=self.pattern_align_mode,
+            pca_components=self.pattern_align_pca_components,
+            hybrid_pca_weight=self.pattern_align_hybrid_pca_weight,
+            filtered_prior_strength=self.pattern_align_filtered_prior_strength,
+            filtered_completion_strength=self.pattern_align_filtered_completion_strength,
+            filtered_completion_gamma=self.pattern_align_filtered_completion_gamma,
+            filtered_noise_suppress=self.pattern_align_filtered_noise_suppress,
+            sim_weight=self.pattern_align_sim_weight,
+            dino_weight=self.pattern_align_dino_weight,
+            student_weight=self.pattern_align_student_weight,
+            period_ratio_x=default_prior_cfg.get("period_ratio_x", 0.0),
+            row_period_ratio_y=default_prior_cfg.get("row_period_ratio_y", 0.0),
+            row_tolerance_ratio_y=default_prior_cfg.get("row_tolerance_ratio_y", 0.0),
+            structural_prior_strength=self.pattern_align_structural_prior_strength,
+            structural_cross_row_strength=self.pattern_align_structural_cross_row_strength,
+            structural_seed_threshold=self.pattern_align_structural_seed_threshold,
+            structural_min_row_seeds=self.pattern_align_structural_min_row_seeds,
+            temperature=self.pattern_align_temperature,
+            mask_floor=self.pattern_align_mask_floor,
+            hard_mask=hard_mask,
+            hard_mask_threshold=hard_mask_threshold,
+            detach=detach,
+        )
+        return mask, stats
+
     def _move_batch_to_device(
         self,
         batch: Dict[str, Any],
@@ -1029,6 +1642,60 @@ class MTKDTrainerV2:
             strong_hflip = strong_hflip.to(self.device)
 
         return images, targets, image_paths, images_weak, strong_hflip
+
+    def _gate_pseudo_batch_by_hard_mask(
+        self,
+        pseudo_batch: Optional[Dict[str, torch.Tensor]],
+        hard_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, float]]:
+        if pseudo_batch is None or hard_mask is None:
+            return pseudo_batch, {}
+        if not isinstance(hard_mask, torch.Tensor) or hard_mask.ndim != 4 or hard_mask.shape[1] != 1:
+            return pseudo_batch, {}
+        if pseudo_batch.get("bboxes") is None or pseudo_batch["bboxes"].shape[0] == 0:
+            return pseudo_batch, {}
+
+        mask = hard_mask.float()
+        mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        batch_idx = pseudo_batch["batch_idx"].long()
+        bboxes = pseudo_batch["bboxes"]
+        if bboxes.ndim != 2 or bboxes.shape[0] != batch_idx.shape[0] or bboxes.shape[1] < 2:
+            return pseudo_batch, {}
+
+        height = int(mask.shape[2])
+        width = int(mask.shape[3])
+        cx = bboxes[:, 0].clamp(0.0, 1.0 - 1e-6)
+        cy = bboxes[:, 1].clamp(0.0, 1.0 - 1e-6)
+        xs = torch.clamp((cx * width).long(), min=0, max=max(width - 1, 0))
+        ys = torch.clamp((cy * height).long(), min=0, max=max(height - 1, 0))
+        keep = mask[batch_idx, 0, ys, xs] > 0.5
+
+        total = int(keep.numel())
+        kept = int(keep.sum().item())
+        stats = {
+            "pseudo_gate_total_boxes": float(total),
+            "pseudo_gate_kept_boxes": float(kept),
+            "pseudo_gate_keep_ratio": float(kept / max(total, 1)),
+            "pseudo_gate_mask_coverage": float(mask.mean().item()),
+        }
+
+        if kept <= 0:
+            empty_batch = {
+                "batch_idx": pseudo_batch["batch_idx"][:0],
+                "cls": pseudo_batch["cls"][:0],
+                "bboxes": pseudo_batch["bboxes"][:0],
+            }
+            return empty_batch, stats
+        if kept == total:
+            return pseudo_batch, stats
+
+        gated = {}
+        for key, value in pseudo_batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == total:
+                gated[key] = value[keep]
+            else:
+                gated[key] = value
+        return gated, stats
 
     @staticmethod
     def _merge_loss_dict(
@@ -1065,6 +1732,185 @@ class MTKDTrainerV2:
             )
         return loss_dict
 
+    @staticmethod
+    def _build_patch_prior_mask(
+        targets: Dict[str, Any],
+        spatial_hw: Tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        boxes = targets.get("boxes")
+        valid_mask = targets.get("valid_mask")
+        if not isinstance(boxes, torch.Tensor) or not isinstance(valid_mask, torch.Tensor):
+            return None
+        if boxes.ndim != 3 or valid_mask.ndim != 2 or boxes.shape[:2] != valid_mask.shape:
+            return None
+
+        h, w = int(spatial_hw[0]), int(spatial_hw[1])
+        if h <= 0 or w <= 0:
+            return None
+
+        boxes_xywh = boxes[..., :4].float()
+        valid = valid_mask.bool()
+        if not bool(valid.any().item()):
+            return torch.zeros(
+                (boxes.shape[0], 1, h, w),
+                dtype=torch.float32,
+                device=boxes.device,
+            )
+
+        cx = boxes_xywh[..., 0].clamp(0.0, 1.0)
+        cy = boxes_xywh[..., 1].clamp(0.0, 1.0)
+        bw = boxes_xywh[..., 2].clamp(0.0, 1.0)
+        bh = boxes_xywh[..., 3].clamp(0.0, 1.0)
+        x0 = (cx - 0.5 * bw).clamp(0.0, 1.0)
+        x1 = (cx + 0.5 * bw).clamp(0.0, 1.0)
+        y0 = (cy - 0.5 * bh).clamp(0.0, 1.0)
+        y1 = (cy + 0.5 * bh).clamp(0.0, 1.0)
+
+        ys = (torch.arange(h, device=boxes.device, dtype=torch.float32) + 0.5) / float(h)
+        xs = (torch.arange(w, device=boxes.device, dtype=torch.float32) + 0.5) / float(w)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        xx = xx.unsqueeze(0).unsqueeze(0)
+        yy = yy.unsqueeze(0).unsqueeze(0)
+
+        inside = (
+            (xx >= x0.unsqueeze(-1).unsqueeze(-1))
+            & (xx <= x1.unsqueeze(-1).unsqueeze(-1))
+            & (yy >= y0.unsqueeze(-1).unsqueeze(-1))
+            & (yy <= y1.unsqueeze(-1).unsqueeze(-1))
+            & valid.unsqueeze(-1).unsqueeze(-1)
+        )
+        mask = inside.any(dim=1, keepdim=True).float()
+        return mask
+
+    @staticmethod
+    def _merge_prior_targets(
+        *masks: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        merged: Optional[torch.Tensor] = None
+        for mask in masks:
+            if not isinstance(mask, torch.Tensor):
+                continue
+            if merged is None:
+                merged = mask.float()
+                continue
+            if merged.shape[2:] != mask.shape[2:]:
+                mask = F.interpolate(
+                    mask.float(),
+                    size=merged.shape[2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            merged = torch.maximum(merged, mask.float())
+        return merged
+
+    def _compute_student_gate_distill_loss(
+        self,
+        teacher_target: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        if (
+            not self.student_gate_distill_enabled
+            or teacher_target is None
+            or self.student_gate_distill_w <= 0.0
+        ):
+            return None, {}
+        student = getattr(self.model, "student", None)
+        get_gate_maps = getattr(student, "get_support_gate_maps", None)
+        if not callable(get_gate_maps):
+            return None, {}
+
+        records = get_gate_maps()
+        if not records:
+            return None, {"student_gate_count": 0.0}
+
+        target = teacher_target.detach().float()
+        losses: List[torch.Tensor] = []
+        means: List[float] = []
+        target_means: List[float] = []
+        for rec in records:
+            logits = rec.get("logits") if isinstance(rec, dict) else None
+            mask = rec.get("mask") if isinstance(rec, dict) else None
+            if not isinstance(logits, torch.Tensor) or not isinstance(mask, torch.Tensor):
+                continue
+            gate_target = target.to(device=logits.device, dtype=logits.dtype)
+            if gate_target.shape[2:] != logits.shape[2:]:
+                gate_target = F.interpolate(
+                    gate_target,
+                    size=logits.shape[2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            pos_weight = torch.tensor(
+                [max(float(self.student_gate_distill_pos_w), 1e-6)],
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            bce = F.binary_cross_entropy_with_logits(logits, gate_target, pos_weight=pos_weight)
+            mse = F.mse_loss(mask, gate_target)
+            losses.append(float(self.student_gate_distill_bce_w) * bce + float(self.student_gate_distill_mse_w) * mse)
+            means.append(float(mask.detach().mean().item()))
+            target_means.append(float(gate_target.detach().mean().item()))
+
+        if not losses:
+            return None, {"student_gate_count": float(len(records))}
+        loss = torch.stack(losses).mean()
+        return loss, {
+            "student_gate_count": float(len(losses)),
+            "student_gate_mask_mean": float(np.mean(means)) if means else 0.0,
+            "student_gate_target_mean": float(np.mean(target_means)) if target_means else 0.0,
+        }
+
+    @staticmethod
+    def _profile_autocorr(profile: torch.Tensor) -> torch.Tensor:
+        if profile.ndim != 2:
+            raise ValueError(f"_profile_autocorr expects [B, L], got {tuple(profile.shape)}")
+        centered = profile - profile.mean(dim=1, keepdim=True)
+        denom = centered.square().sum(dim=1, keepdim=True).clamp_min(1e-6)
+        n = int(centered.shape[1])
+        fft = torch.fft.rfft(centered, n=2 * n, dim=1)
+        acf = torch.fft.irfft(fft * torch.conj(fft), n=2 * n, dim=1)[:, :n]
+        return acf / denom
+
+    def _compute_prior_periodic_loss(
+        self,
+        student_prob: torch.Tensor,
+        teacher_target: torch.Tensor,
+    ) -> torch.Tensor:
+        if student_prob.ndim != 4 or teacher_target.ndim != 4:
+            raise ValueError("prior periodic loss expects [B,1,H,W] tensors")
+        if student_prob.shape[2:] != teacher_target.shape[2:]:
+            teacher_target = F.interpolate(
+                teacher_target.float(),
+                size=student_prob.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        student_map = student_prob.squeeze(1).float()
+        teacher_map = teacher_target.squeeze(1).float()
+
+        # Horizontal periodicity is the primary signal; row profile is auxiliary.
+        student_col = student_map.mean(dim=1)
+        teacher_col = teacher_map.mean(dim=1)
+        student_row = student_map.mean(dim=2)
+        teacher_row = teacher_map.mean(dim=2)
+
+        col_profile_loss = F.mse_loss(student_col, teacher_col)
+        row_profile_loss = F.mse_loss(student_row, teacher_row)
+        col_acf_loss = F.mse_loss(
+            self._profile_autocorr(student_col),
+            self._profile_autocorr(teacher_col),
+        )
+        row_acf_loss = F.mse_loss(
+            self._profile_autocorr(student_row),
+            self._profile_autocorr(teacher_row),
+        )
+
+        col_term = 0.35 * col_profile_loss + 0.65 * col_acf_loss
+        row_term = 0.35 * row_profile_loss + 0.65 * row_acf_loss
+        return (
+            float(self.prior_periodic_col_w) * col_term
+            + float(self.prior_periodic_row_w) * row_term
+        )
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
         One epoch following the 2-stage MTKD schedule.
@@ -1079,7 +1925,7 @@ class MTKDTrainerV2:
         for batch_idx, batch in enumerate(self.train_loader):
             # === Determine stage ===
             do_target_align = epoch >= self.align_target_start_epoch
-            do_source_align = True
+            do_source_align = self.use_source_alignment
 
             is_dual_stream_batch = (
                 isinstance(batch, (tuple, list))
@@ -1130,7 +1976,9 @@ class MTKDTrainerV2:
                         self.use_pseudo_supervision or self.use_target_alignment
                     )
                     if run_unlabel_branch:
-                        unlabel_need_teacher = bool(self.use_target_alignment)
+                        unlabel_need_teacher = bool(
+                            self.use_target_alignment or self.pseudo_hard_mask_gate_enabled
+                        )
                         unlabel_loss, unlabel_loss_dict = self._forward_and_loss(
                             unlabel_images,
                             unlabel_targets,
@@ -1164,7 +2012,7 @@ class MTKDTrainerV2:
                 images, targets, image_paths, images_weak, strong_hflip = self._move_batch_to_device(batch)
 
                 need_teacher = do_source_align or (
-                    do_target_align and self.use_target_alignment
+                    do_target_align and (self.use_target_alignment or self.pseudo_hard_mask_gate_enabled)
                 )
                 if self.scaler is not None:
                     with torch.amp.autocast("cuda"):
@@ -1336,6 +2184,41 @@ class MTKDTrainerV2:
             teacher_images=teacher_images_align if need_teacher_feat else None,
         )
 
+        pseudo_gate_mask = None
+        if (
+            self.pseudo_hard_mask_gate_enabled
+            and do_target_align
+            and use_pseudo_supervision
+            and pseudo_batch is not None
+            and pseudo_batch["bboxes"].shape[0] > 0
+        ):
+            student_feat_for_gate = out.get("student_spatial_feat")
+            dino_feat_for_gate = out.get("dino_features")
+            if (
+                student_feat_for_gate is not None
+                and dino_feat_for_gate is not None
+                and hasattr(self.model, "build_pattern_align_mask")
+            ):
+                pseudo_gate_mask, pseudo_gate_stats = self._build_pattern_align_mask_for_batch(
+                    student_feat_for_gate,
+                    dino_feat_for_gate,
+                    image_paths,
+                    images,
+                    self.pattern_align_target_prior_cfg,
+                    use_bypass=self.pattern_align_use_dino_bypass,
+                    hard_mask=True,
+                    hard_mask_threshold=self.pattern_align_hard_mask_threshold,
+                    detach=True,
+                )
+                for key, val in pseudo_gate_stats.items():
+                    loss_dict[f"{key}_pseudo_gate"] = float(val)
+                pseudo_batch, gate_stats = self._gate_pseudo_batch_by_hard_mask(
+                    pseudo_batch,
+                    pseudo_gate_mask,
+                )
+                for key, val in gate_stats.items():
+                    loss_dict[key] = float(val)
+
         # ----- Add align head params to optimizer if just lazily created -----
         if getattr(self.model, "_align_head_just_created", False):
             self.optimizer.add_param_group({
@@ -1344,6 +2227,13 @@ class MTKDTrainerV2:
             })
             self.model._align_head_just_created = False
             self.logger.info("Added alignment head parameters to optimizer")
+        if getattr(self.model, "_student_prior_head_just_created", False):
+            self.optimizer.add_param_group({
+                "params": list(self.model.student_prior_head.parameters()),
+                "lr": self.config["training"]["learning_rate"],
+            })
+            self.model._student_prior_head_just_created = False
+            self.logger.info("Added student prior head parameters to optimizer")
 
         # ----- Detection loss (GT supervision) -----
         if use_gt_supervision:
@@ -1365,7 +2255,95 @@ class MTKDTrainerV2:
             student_feat = out.get("student_spatial_feat")
             dino_feat = out.get("dino_features")
             if student_feat is not None and dino_feat is not None:
-                align_loss = self.model.compute_align_loss(student_feat, dino_feat)
+                pattern_mask_for_align = None
+                if self.pattern_align_enabled and hasattr(self.model, "build_pattern_align_mask"):
+                    pattern_mask_for_align, pattern_stats = self._build_pattern_align_mask_for_batch(
+                        student_feat,
+                        dino_feat,
+                        image_paths,
+                        images,
+                        self.pattern_align_source_prior_cfg,
+                        use_bypass=False,
+                        hard_mask=self.pattern_align_hard_mask,
+                        hard_mask_threshold=self.pattern_align_hard_mask_threshold,
+                        detach=self.pattern_align_detach_mask,
+                    )
+                    for key, val in pattern_stats.items():
+                        loss_dict[key] = float(val)
+
+                prior_mask_for_align = None
+                if getattr(self.model, "use_stomata_prior", False):
+                    prior_mode = str(getattr(self.model, "prior_head_mode", "origin"))
+                    prior_out = self.model.predict_stomata_prior(
+                        dino_features=dino_feat,
+                        student_spatial_feat=student_feat,
+                        output_hw=dino_feat.shape[2:],
+                    )
+                    gt_prior_mask = self._build_patch_prior_mask(
+                        targets,
+                        dino_feat.shape[2:],
+                    )
+                    teacher_prior_target = None
+                    if prior_mode == "origin":
+                        teacher_prior_target = gt_prior_mask
+                    else:
+                        teacher_prior_target = self._merge_prior_targets(
+                            gt_prior_mask,
+                            pattern_mask_for_align,
+                        )
+
+                    if prior_out is not None and teacher_prior_target is not None:
+                        pos_weight = torch.tensor(
+                            [self.prior_mask_pos_w],
+                            dtype=prior_out["logits"].dtype,
+                            device=prior_out["logits"].device,
+                        )
+                        prior_loss = F.binary_cross_entropy_with_logits(
+                            prior_out["logits"],
+                            teacher_prior_target,
+                            pos_weight=pos_weight,
+                        )
+                        weighted_prior = prior_loss * self.prior_mask_loss_w
+                        losses.append(weighted_prior)
+                        loss_dict["loss_prior_mask"] = prior_loss.item()
+                        loss_dict["prior_mask_mean"] = prior_out["prob"].mean().item()
+                        loss_dict["prior_teacher_coverage"] = teacher_prior_target.mean().item()
+                        if (
+                            self.prior_propagation_loss_w > 0.0
+                            and isinstance(prior_out.get("propagation_logits"), torch.Tensor)
+                        ):
+                            prop_loss = F.binary_cross_entropy_with_logits(
+                                prior_out["propagation_logits"],
+                                teacher_prior_target,
+                                pos_weight=pos_weight,
+                            )
+                            losses.append(prop_loss * self.prior_propagation_loss_w)
+                            loss_dict["loss_prior_propagation"] = prop_loss.item()
+                            if isinstance(prior_out.get("propagation_prob"), torch.Tensor):
+                                loss_dict["prior_propagation_mean"] = prior_out["propagation_prob"].mean().item()
+                        if self.prior_periodic_loss_w > 0.0:
+                            periodic_loss = self._compute_prior_periodic_loss(
+                                prior_out["prob"],
+                                teacher_prior_target,
+                            )
+                            losses.append(periodic_loss * self.prior_periodic_loss_w)
+                            loss_dict["loss_prior_periodic"] = periodic_loss.item()
+                        if gt_prior_mask is not None:
+                            loss_dict["prior_gt_coverage"] = gt_prior_mask.mean().item()
+                        if pattern_mask_for_align is not None:
+                            loss_dict["prior_pattern_coverage"] = pattern_mask_for_align.mean().item()
+                        prior_mask_for_align = prior_out["prob"]
+
+                if prior_mask_for_align is not None and pattern_mask_for_align is not None:
+                    prior_mask_for_align = torch.maximum(prior_mask_for_align, pattern_mask_for_align)
+                elif pattern_mask_for_align is not None:
+                    prior_mask_for_align = pattern_mask_for_align
+
+                align_loss = self.model.compute_align_loss(
+                    student_feat,
+                    dino_feat,
+                    prior_mask=prior_mask_for_align,
+                )
                 weighted = align_loss * self.feature_align_w
                 losses.append(weighted)
                 loss_dict["loss_align"] = align_loss.item()
@@ -1381,10 +2359,94 @@ class MTKDTrainerV2:
             student_feat = out.get("student_spatial_feat")
             dino_feat = out.get("dino_features")
             if student_feat is not None and dino_feat is not None:
+                target_mask_for_align = None
+                if (
+                    self.pattern_align_enabled
+                    and self.pattern_align_on_target
+                    and hasattr(self.model, "build_pattern_align_mask")
+                ):
+                    target_mask_for_align, target_pattern_stats = self._build_pattern_align_mask_for_batch(
+                        student_feat,
+                        dino_feat,
+                        image_paths,
+                        images,
+                        self.pattern_align_target_prior_cfg,
+                        use_bypass=self.pattern_align_use_dino_bypass,
+                        hard_mask=self.pattern_align_hard_mask,
+                        hard_mask_threshold=self.pattern_align_hard_mask_threshold,
+                        detach=self.pattern_align_detach_mask,
+                    )
+                    for key, val in target_pattern_stats.items():
+                        loss_dict[f"{key}_target"] = float(val)
+
+                if (
+                    getattr(self.model, "use_stomata_prior", False)
+                    and str(getattr(self.model, "prior_head_mode", "origin")) == "freq_adaption"
+                ):
+                    target_prior_out = self.model.predict_stomata_prior(
+                        dino_features=dino_feat,
+                        student_spatial_feat=student_feat,
+                        output_hw=dino_feat.shape[2:],
+                    )
+                    teacher_prior_target = self._merge_prior_targets(target_mask_for_align)
+                    if target_prior_out is not None and teacher_prior_target is not None:
+                        pos_weight = torch.tensor(
+                            [self.prior_mask_pos_w],
+                            dtype=target_prior_out["logits"].dtype,
+                            device=target_prior_out["logits"].device,
+                        )
+                        prior_loss_target = F.binary_cross_entropy_with_logits(
+                            target_prior_out["logits"],
+                            teacher_prior_target,
+                            pos_weight=pos_weight,
+                        )
+                        weighted_prior_target = prior_loss_target * self.prior_mask_loss_w_target
+                        losses.append(weighted_prior_target)
+                        loss_dict["loss_prior_mask_target"] = prior_loss_target.item()
+                        loss_dict["prior_mask_mean_target"] = target_prior_out["prob"].mean().item()
+                        loss_dict["prior_teacher_coverage_target"] = teacher_prior_target.mean().item()
+                        if (
+                            self.prior_propagation_loss_w > 0.0
+                            and isinstance(target_prior_out.get("propagation_logits"), torch.Tensor)
+                        ):
+                            prop_loss_target = F.binary_cross_entropy_with_logits(
+                                target_prior_out["propagation_logits"],
+                                teacher_prior_target,
+                                pos_weight=pos_weight,
+                            )
+                            losses.append(prop_loss_target * self.prior_propagation_loss_w)
+                            loss_dict["loss_prior_propagation_target"] = prop_loss_target.item()
+                            if isinstance(target_prior_out.get("propagation_prob"), torch.Tensor):
+                                loss_dict["prior_propagation_mean_target"] = target_prior_out["propagation_prob"].mean().item()
+                        if self.prior_periodic_loss_w > 0.0:
+                            periodic_loss_target = self._compute_prior_periodic_loss(
+                                target_prior_out["prob"],
+                                teacher_prior_target,
+                            )
+                            losses.append(periodic_loss_target * self.prior_periodic_loss_w)
+                            loss_dict["loss_prior_periodic_target"] = periodic_loss_target.item()
+                        if target_mask_for_align is not None:
+                            target_mask_for_align = torch.maximum(
+                                target_mask_for_align,
+                                target_prior_out["prob"],
+                            )
+                        else:
+                            target_mask_for_align = target_prior_out["prob"]
+
+                gate_distill_loss, gate_distill_stats = self._compute_student_gate_distill_loss(target_mask_for_align)
+                if gate_distill_loss is not None:
+                    losses.append(gate_distill_loss * self.student_gate_distill_w)
+                    loss_dict["loss_student_gate_distill"] = float(gate_distill_loss.item())
+                    for key, val in gate_distill_stats.items():
+                        loss_dict[key] = float(val)
+
                 # Reuse align_loss if already computed, else recompute
-                if "loss_align" not in loss_dict:
+                if "loss_align" not in loss_dict or target_mask_for_align is not None:
                     align_loss_target = self.model.compute_align_loss(
-                        student_feat, dino_feat)
+                        student_feat,
+                        dino_feat,
+                        prior_mask=target_mask_for_align,
+                    )
                 else:
                     align_loss_target = align_loss  # same data → same value
                 weighted_target = align_loss_target * self.feature_align_w_target
@@ -1488,6 +2550,23 @@ class MTKDTrainerV2:
             loss_dict["loss_det_dfl"] = loss_dict["loss_pseudo_dfl"]
         if "loss_det_angle" not in loss_dict and "loss_pseudo_angle" in loss_dict:
             loss_dict["loss_det_angle"] = loss_dict["loss_pseudo_angle"]
+
+        if self.weight_anchor_enabled and self.weight_anchor_lambda > 0.0 and self._student_anchor_params:
+            anchor_loss = images.new_tensor(0.0)
+            counted = 0
+            for name, param in self.model.student.named_parameters():
+                if not param.requires_grad:
+                    continue
+                anchor = self._student_anchor_params.get(name)
+                if anchor is None:
+                    continue
+                anchor_loss = anchor_loss + torch.sum((param - anchor) ** 2)
+                counted += 1
+            if counted > 0:
+                weighted_anchor = anchor_loss * self.weight_anchor_lambda
+                losses.append(weighted_anchor)
+                loss_dict["loss_weight_anchor"] = float(anchor_loss.detach().item())
+                loss_dict["loss_weight_anchor_weighted"] = float(weighted_anchor.detach().item())
 
         if len(losses) == 0:
             total_loss = images.new_tensor(0.0)
@@ -1609,6 +2688,577 @@ class MTKDTrainerV2:
             "bboxes": torch.tensor(all_bboxes, dtype=torch.float32, device=self.device),
         }
 
+    @staticmethod
+    def _map_to_uint8(values: np.ndarray) -> np.ndarray:
+        values = values.astype(np.float32)
+        lo = float(np.percentile(values, 5))
+        hi = float(np.percentile(values, 95))
+        if hi <= lo:
+            hi = lo + 1e-6
+        norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        return (norm * 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _map_to_color_pil(values: np.ndarray, size: Tuple[int, int]) -> Image.Image:
+        values = values.astype(np.float32)
+        lo = float(np.percentile(values, 5))
+        hi = float(np.percentile(values, 95))
+        if hi <= lo:
+            hi = lo + 1e-6
+        norm = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+        rgba = matplotlib.colormaps.get_cmap("turbo")(norm)
+        rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+        image = Image.fromarray(rgb, mode="RGB")
+        return image.resize(size, resample=Image.Resampling.BILINEAR)
+
+    @staticmethod
+    def _tensor_image_to_pil(image_tensor: torch.Tensor) -> Image.Image:
+        image = (
+            image_tensor.detach()
+            .cpu()
+            .float()
+            .clamp(0.0, 1.0)
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        return Image.fromarray((image * 255.0).astype(np.uint8), mode="RGB")
+
+    @classmethod
+    def _feature_response_to_pil(
+        cls,
+        feat: torch.Tensor,
+        size: Tuple[int, int],
+    ) -> Image.Image:
+        response = torch.linalg.norm(feat.detach().float(), dim=0).cpu().numpy()
+        return cls._map_to_color_pil(response, size)
+
+    @classmethod
+    def _mask_to_pil(
+        cls,
+        mask: torch.Tensor,
+        size: Tuple[int, int],
+    ) -> Image.Image:
+        if mask.ndim == 3:
+            mask = mask.squeeze(0)
+        return cls._map_to_color_pil(mask.detach().float().cpu().numpy(), size)
+
+    @classmethod
+    def _overlay_mask_on_image(
+        cls,
+        image: Image.Image,
+        mask: torch.Tensor,
+        *,
+        alpha: float = 0.55,
+    ) -> Image.Image:
+        if mask.ndim == 3:
+            mask = mask.squeeze(0)
+        mask_np = mask.detach().float().cpu().numpy()
+        mask_img = cls._mask_to_pil(mask, image.size).convert("RGBA")
+        alpha_img = Image.fromarray(
+            cls._map_to_uint8(mask_np),
+            mode="L",
+        ).resize(image.size, resample=Image.Resampling.BILINEAR)
+        base = image.convert("RGBA")
+        mask_img.putalpha(alpha_img.point(lambda x: int(alpha * x)))
+        return Image.alpha_composite(base, mask_img).convert("RGB")
+
+    @staticmethod
+    def _find_detect_module(det_model: nn.Module) -> nn.Module:
+        detect_module = None
+        modules = getattr(det_model, "model", None)
+        if modules is not None and len(modules) > 0:
+            for module in reversed(modules):
+                if module.__class__.__name__.lower() in {"detect", "obb"}:
+                    detect_module = module
+                    break
+        if detect_module is None:
+            raise RuntimeError("Could not locate Detect/OBB module for debug export")
+        return detect_module
+
+    @staticmethod
+    def _normalized_box_to_poly(box: np.ndarray, image_size: Tuple[int, int]) -> List[Tuple[float, float]]:
+        w_img, h_img = image_size
+        if box.shape[0] >= 5:
+            cx, cy, bw, bh, angle = [float(v) for v in box[:5]]
+            cx *= w_img
+            cy *= h_img
+            bw *= w_img
+            bh *= h_img
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            corners = [
+                (-bw / 2.0, -bh / 2.0),
+                (bw / 2.0, -bh / 2.0),
+                (bw / 2.0, bh / 2.0),
+                (-bw / 2.0, bh / 2.0),
+            ]
+            points: List[Tuple[float, float]] = []
+            for px, py in corners:
+                rx = cx + px * cos_a - py * sin_a
+                ry = cy + px * sin_a + py * cos_a
+                points.append((rx, ry))
+            return points
+
+        cx, cy, bw, bh = [float(v) for v in box[:4]]
+        cx *= w_img
+        cy *= h_img
+        bw *= w_img
+        bh *= h_img
+        x1 = cx - bw / 2.0
+        y1 = cy - bh / 2.0
+        x2 = cx + bw / 2.0
+        y2 = cy + bh / 2.0
+        return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    @staticmethod
+    def _get_debug_font(size: int) -> ImageFont.ImageFont:
+        try:
+            font_path = matplotlib.font_manager.findfont("DejaVu Sans")
+            return ImageFont.truetype(font_path, size=max(1, int(size)))
+        except Exception:
+            return ImageFont.load_default()
+
+    @classmethod
+    def _draw_debug_predictions(
+        cls,
+        image: Image.Image,
+        pred: Dict[str, torch.Tensor],
+        *,
+        color: Tuple[int, int, int],
+        title: Optional[str] = None,
+        score_threshold: float = 0.1,
+        max_boxes: int = 300,
+    ) -> Image.Image:
+        canvas = image.copy()
+        draw = ImageDraw.Draw(canvas)
+        boxes = pred.get("boxes")
+        scores = pred.get("scores")
+        labels = pred.get("labels")
+        if not isinstance(boxes, torch.Tensor) or not isinstance(scores, torch.Tensor):
+            return canvas
+        if boxes.ndim == 3:
+            boxes = boxes[0]
+        if scores.ndim == 2:
+            scores = scores[0]
+        if isinstance(labels, torch.Tensor) and labels.ndim == 2:
+            labels = labels[0]
+        keep = scores >= float(score_threshold)
+        if keep.ndim > 1:
+            keep = keep.view(-1)
+        boxes = boxes[keep][:max_boxes].detach().cpu().float().numpy()
+        scores = scores[keep][:max_boxes].detach().cpu().float().numpy()
+        labels_np = (
+            labels[keep][:max_boxes].detach().cpu().long().numpy()
+            if isinstance(labels, torch.Tensor)
+            else np.zeros((boxes.shape[0],), dtype=np.int64)
+        )
+        for box, score, cls_id in zip(boxes, scores, labels_np):
+            poly = cls._normalized_box_to_poly(np.asarray(box, dtype=np.float32), canvas.size)
+            draw.line(poly + [poly[0]], fill=color, width=2)
+            if title is not None:
+                text = f"{int(cls_id)}:{float(score):.2f}"
+                tx, ty = poly[0]
+                font = cls._get_debug_font(18)
+                draw.text(
+                    (tx + 2, ty + 2),
+                    text,
+                    fill=color,
+                    font=font,
+                    stroke_width=2,
+                    stroke_fill=(0, 0, 0),
+                )
+        return canvas
+
+    def _predict_student_with_support(
+        self,
+        images: torch.Tensor,
+        support_map: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        student = self.model.student
+        if support_map is None:
+            return student.get_detection_output(images)
+        detect_module = self._find_detect_module(student.det_model)
+        level_name = str(getattr(self.model, "student_align_layer", getattr(student, "feature_level", "p4"))).lower()
+        level_idx = getattr(student, "feature_level_to_idx", {"p3": 0, "p4": 1, "p5": 2}).get(level_name, 1)
+        support = support_map.detach()
+        gate_hard = bool(getattr(self.model, "prior_gate_hard", False))
+        gate_threshold = float(getattr(self.model, "prior_gate_threshold", 0.5))
+        bg_scale = getattr(self.model, "prior_gate_bg_scale", None)
+        fg_scale = getattr(self.model, "prior_gate_fg_scale", None)
+        gate_strength = float(getattr(self.model, "prior_gate_strength", 1.0))
+
+        def _enhance_detect_input(_module, inputs):
+            if not inputs:
+                return None
+            x = inputs[0]
+            if not isinstance(x, (list, tuple)):
+                return None
+            feats = list(x)
+            if level_idx >= len(feats):
+                return None
+            target = feats[level_idx]
+            gate = F.interpolate(
+                support.to(device=target.device, dtype=target.dtype),
+                size=target.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if gate_hard:
+                gate = (gate >= gate_threshold).to(dtype=target.dtype)
+            if bg_scale is not None or fg_scale is not None:
+                bg = float(1.0 if bg_scale is None else bg_scale)
+                fg = float((1.0 + gate_strength) if fg_scale is None else fg_scale)
+                scale = bg + (fg - bg) * gate
+            else:
+                scale = 1.0 + gate_strength * gate
+            feats[level_idx] = target * scale
+            return (tuple(feats),) if isinstance(x, tuple) else (feats,)
+
+        handle = detect_module.register_forward_pre_hook(_enhance_detect_input)
+        try:
+            return student.get_detection_output(images)
+        finally:
+            handle.remove()
+
+    @staticmethod
+    def _make_tile(image: Image.Image, title: str, tile_size: int) -> Image.Image:
+        canvas_h = tile_size + 42
+        canvas = Image.new("RGB", (tile_size, canvas_h), color=(255, 255, 255))
+        resized = image.resize((tile_size, tile_size), resample=Image.Resampling.BICUBIC)
+        canvas.paste(resized, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        font = MTKDTrainerV2._get_debug_font(20)
+        draw.text(
+            (8, tile_size + 8),
+            title,
+            fill=(0, 0, 0),
+            font=font,
+            stroke_width=2,
+            stroke_fill=(255, 255, 255),
+        )
+        return canvas
+
+    @classmethod
+    def _make_grid(cls, tiles: List[Image.Image], cols: int) -> Image.Image:
+        if not tiles:
+            raise ValueError("tiles must not be empty")
+        cols = max(1, cols)
+        tile_w, tile_h = tiles[0].size
+        rows = int(math.ceil(len(tiles) / cols))
+        panel = Image.new("RGB", (tile_w * cols, tile_h * rows), color=(245, 245, 245))
+        for idx, tile in enumerate(tiles):
+            x = (idx % cols) * tile_w
+            y = (idx // cols) * tile_h
+            panel.paste(tile, (x, y))
+        return panel
+
+    def _select_debug_batch(self) -> Optional[Tuple[Dict[str, Any], bool]]:
+        if self.train_loader is None and self.val_loader is None:
+            return None
+        prefer_train = self.dual_stream or self.use_pseudo_supervision or self.use_target_alignment
+        loader = self.train_loader if prefer_train and self.train_loader is not None else self.val_loader
+        if loader is None:
+            loader = self.train_loader
+        if loader is None:
+            return None
+
+        batch = next(iter(loader))
+        if (
+            isinstance(batch, (tuple, list))
+            and len(batch) == 2
+            and isinstance(batch[0], dict)
+            and isinstance(batch[1], dict)
+        ):
+            use_unlabeled = self.use_pseudo_supervision or self.use_target_alignment
+            return (batch[1] if use_unlabeled else batch[0], use_unlabeled)
+        if isinstance(batch, dict):
+            return batch, False
+        return None
+
+    def _build_debug_pseudo_batch(
+        self,
+        images: torch.Tensor,
+        image_paths: List[str],
+        *,
+        strong_hflip: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.use_pseudo_supervision:
+            return None
+
+        hflip_mask = None
+        if strong_hflip is not None:
+            hflip_mask = strong_hflip.detach().cpu().tolist()
+
+        if self.use_offline_pseudo and self.pseudo_labels is not None and image_paths:
+            stems = [Path(p).stem for p in image_paths]
+            return build_yolo_batch_from_pseudo(
+                self.pseudo_labels,
+                stems,
+                self.device,
+                horizontal_flip_mask=hflip_mask,
+            )
+        if self.use_online_teacher_pseudo:
+            teacher_pred = self.model.get_wheat_teacher_predictions(images)
+            return self._build_yolo_batch_from_teacher_output(teacher_pred)
+        return None
+
+    def _save_debug_pseudo_label(
+        self,
+        pseudo_batch: Optional[Dict[str, torch.Tensor]],
+        sample_index: int,
+        save_path: str,
+    ) -> None:
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if pseudo_batch is None:
+            path.write_text("", encoding="utf-8")
+            return
+
+        batch_idx = pseudo_batch.get("batch_idx")
+        cls_tensor = pseudo_batch.get("cls")
+        bboxes = pseudo_batch.get("bboxes")
+        if not isinstance(batch_idx, torch.Tensor) or not isinstance(cls_tensor, torch.Tensor) or not isinstance(bboxes, torch.Tensor):
+            path.write_text("", encoding="utf-8")
+            return
+
+        mask = batch_idx.long() == int(sample_index)
+        if not bool(mask.any().item()):
+            path.write_text("", encoding="utf-8")
+            return
+
+        cls_np = cls_tensor[mask].detach().cpu().view(-1).numpy()
+        box_np = bboxes[mask].detach().cpu().numpy()
+        lines: List[str] = []
+        for cls_id, box in zip(cls_np.tolist(), box_np.tolist()):
+            tokens = [str(int(round(float(cls_id))))] + [f"{float(v):.6f}" for v in box]
+            lines.append(" ".join(tokens))
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+    def _export_student_dino_bypass_debug_panels(
+        self,
+        image_paths: Sequence[str],
+        epoch_dir: Path,
+        epoch: int,
+    ) -> bool:
+        if not self.pattern_align_use_dino_bypass:
+            return False
+        if not image_paths:
+            return False
+
+        image_path = Path(str(image_paths[0])).expanduser()
+        if not image_path.is_file():
+            return False
+
+        student = getattr(self.model, "student", None)
+        export_fn = getattr(student, "export_ultralytics_pt", None)
+        if student is None or export_fn is None:
+            return False
+
+        try:
+            import train_dino_bypass_offline as dino_bypass
+        except Exception as exc:
+            self.logger.warning("Failed to import train_dino_bypass_offline for debug export: %s", exc)
+            return False
+
+        debug_input_dir = epoch_dir / "_student_dino_bypass_input"
+        debug_input_dir.mkdir(parents=True, exist_ok=True)
+        linked_image = debug_input_dir / image_path.name
+        if not linked_image.exists():
+            try:
+                linked_image.symlink_to(image_path)
+            except Exception:
+                shutil.copy2(image_path, linked_image)
+
+        weights_path = epoch_dir / "_student_debug_current.pt"
+        num_classes = int(self.config.get("model", {}).get("num_classes", 1))
+        class_names = {i: f"class_{i}" for i in range(num_classes)}
+        with self._use_ema_student():
+            export_fn(
+                save_path=str(weights_path),
+                num_classes=num_classes,
+                class_names=class_names,
+                epoch=epoch,
+                best_fitness=float(self.best_score) if np.isfinite(self.best_score) else None,
+            )
+
+        cfg = dict(self._dino_bypass_cfg or {})
+        cfg.update(
+            {
+                "input_dir": str(debug_input_dir),
+                "output_dir": str(epoch_dir),
+                "yolo_weights": str(weights_path),
+                "num_samples": 1,
+                "device": str(self.device),
+                "export_pseudo_dir": None,
+            }
+        )
+        cfg.setdefault("feature_level", str(getattr(self.model, "student_align_layer", "p3")))
+        cfg_path = epoch_dir / "_student_dino_bypass_debug_config.json"
+        cfg_path.write_text(json.dumps({"dino_bypass": cfg}, indent=2), encoding="utf-8")
+
+        old_argv = list(sys.argv)
+        try:
+            sys.argv = ["train_dino_bypass_offline.py", "--config", str(cfg_path)]
+            args = dino_bypass.parse_args()
+        finally:
+            sys.argv = old_argv
+
+        dataset = type("_SingleImageDataset", (), {"files": [linked_image]})()
+        try:
+            dino_bypass.run_detect_test(args, str(args.device), dataset)
+        except Exception as exc:
+            self.logger.warning("Student dino_bypass debug export failed: %s", exc)
+            return False
+
+        self.logger.info(
+            "Saved student dino_bypass debug panels for %s using %s",
+            image_path.name,
+            weights_path.name,
+        )
+        return True
+
+    @torch.no_grad()
+    def _export_epoch_debug(self, epoch: int) -> None:
+        debug_pick = self._select_debug_batch()
+        if debug_pick is None:
+            return
+        debug_batch, _ = debug_pick
+
+        images, targets, image_paths, images_weak, strong_hflip = self._move_batch_to_device(debug_batch)
+        if images.size(0) == 0:
+            return
+
+        teacher_images = images
+        if self.align_easy_only and images_weak is not None and images_weak.shape[0] == images.shape[0]:
+            teacher_images = images_weak
+
+        epoch_dir = Path(self.debug_dir) / f"epoch_{epoch:04d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+        exported_student_bypass_panels = self._export_student_dino_bypass_debug_panels(image_paths, epoch_dir, epoch)
+        if exported_student_bypass_panels:
+            return
+
+        with self._use_ema_student():
+            self.model.eval()
+            debug = self.model.get_alignment_debug(
+                images[:1],
+                teacher_images=teacher_images[:1],
+            )
+
+            student_feat = debug["student_spatial_feat"]
+            dino_feat = debug["dino_features"]
+            mask_for_display: Optional[torch.Tensor] = None
+            student_prior_prob: Optional[torch.Tensor] = None
+            native_gate_prob: Optional[torch.Tensor] = None
+            get_gate_maps = getattr(getattr(self.model, "student", None), "get_support_gate_maps", None)
+            if callable(get_gate_maps):
+                gate_records = get_gate_maps()
+                if gate_records and isinstance(gate_records[0].get("mask"), torch.Tensor):
+                    native_gate_prob = gate_records[0]["mask"][:1]
+            if getattr(self.model, "use_stomata_prior", False):
+                prior_out = self.model.predict_stomata_prior(
+                    dino_features=dino_feat,
+                    student_spatial_feat=student_feat,
+                    output_hw=dino_feat.shape[2:],
+                )
+                if prior_out is not None:
+                    student_prior_prob = prior_out["prob"][:1]
+            if self.pattern_align_enabled and hasattr(self.model, "build_pattern_align_mask"):
+                mask_for_display, _ = self._build_pattern_align_mask_for_batch(
+                    student_feat,
+                    dino_feat,
+                    image_paths,
+                    images,
+                    self.pattern_align_target_prior_cfg,
+                    use_bypass=self.pattern_align_use_dino_bypass,
+                    hard_mask=self.pattern_align_hard_mask,
+                    hard_mask_threshold=self.pattern_align_hard_mask_threshold,
+                    detach=True,
+                )
+            if mask_for_display is None:
+                prior = self.model.predict_stomata_prior(
+                    dino_features=dino_feat,
+                    student_spatial_feat=student_feat,
+                    output_hw=dino_feat.shape[2:],
+                )
+                if prior is not None:
+                    mask_for_display = prior["prob"]
+
+            if mask_for_display is None:
+                return
+
+            applied_support = mask_for_display[:1]
+            if student_prior_prob is not None:
+                applied_support = torch.maximum(applied_support, student_prior_prob)
+
+            mask_small = F.interpolate(
+                applied_support,
+                size=student_feat.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            gate_hard = bool(getattr(self.model, "prior_gate_hard", False))
+            gate_threshold = float(getattr(self.model, "prior_gate_threshold", 0.5))
+            if gate_hard:
+                mask_small = (mask_small >= gate_threshold).to(dtype=student_feat.dtype)
+            bg_scale = getattr(self.model, "prior_gate_bg_scale", None)
+            fg_scale = getattr(self.model, "prior_gate_fg_scale", None)
+            gate_strength = float(getattr(self.model, "prior_gate_strength", 1.0))
+            if bg_scale is not None or fg_scale is not None:
+                bg = float(1.0 if bg_scale is None else bg_scale)
+                fg = float((1.0 + gate_strength) if fg_scale is None else fg_scale)
+                feat_scale = bg + (fg - bg) * mask_small
+            else:
+                feat_scale = 1.0 + gate_strength * mask_small
+            after_feat = student_feat[:1] * feat_scale
+            before_pred = self.model.student.get_detection_output(images[:1])
+            after_pred = self._predict_student_with_support(images[:1], applied_support)
+
+        original = self._tensor_image_to_pil(images[0])
+        support_img = self._mask_to_pil(applied_support[0], original.size)
+        support_overlay = self._overlay_mask_on_image(original, applied_support[0], alpha=0.55)
+        native_gate_img = self._mask_to_pil(native_gate_prob[0], original.size) if native_gate_prob is not None else None
+        before_img = self._feature_response_to_pil(student_feat[0], original.size)
+        after_img = self._feature_response_to_pil(after_feat[0], original.size)
+        before_pred_img = self._draw_debug_predictions(
+            original,
+            before_pred,
+            color=(0, 245, 255),
+            score_threshold=self.debug_pred_conf,
+            max_boxes=self.debug_pred_max_boxes,
+        )
+        after_pred_img = self._draw_debug_predictions(
+            original,
+            after_pred,
+            color=(255, 35, 210),
+            score_threshold=self.debug_pred_conf,
+            max_boxes=self.debug_pred_max_boxes,
+        )
+
+        tiles = [
+            self._make_tile(original, "Origin Image", self.debug_tile_size),
+            self._make_tile(support_overlay, "Pattern Support Overlay", self.debug_tile_size),
+            self._make_tile(support_img, "Pattern Support Heatmap", self.debug_tile_size),
+            self._make_tile(native_gate_img if native_gate_img is not None else original, "Student Native Gate", self.debug_tile_size),
+            self._make_tile(before_img, "Student Feature Before", self.debug_tile_size),
+            self._make_tile(after_img, "Student Feature After", self.debug_tile_size),
+        ]
+        feature_panel = self._make_grid(tiles, cols=3)
+        prediction_tiles = [
+            self._make_tile(before_pred_img, "Before Alignment Prediction", self.debug_tile_size),
+            self._make_tile(after_pred_img, "After Alignment Prediction", self.debug_tile_size),
+        ]
+        prediction_panel = self._make_grid(prediction_tiles, cols=2)
+
+        stem = Path(image_paths[0]).stem if image_paths else f"sample0_epoch{epoch:04d}"
+        feature_panel_path = epoch_dir / f"{stem}_feature_panel.png"
+        prediction_panel_path = epoch_dir / f"{stem}_prediction_panel.png"
+
+        feature_panel.save(feature_panel_path)
+        prediction_panel.save(prediction_panel_path)
+        self.logger.info("Saved debug export: %s", feature_panel_path)
+
     # ------------------------------------------------------------------
     # Validate
     # ------------------------------------------------------------------
@@ -1624,6 +3274,7 @@ class MTKDTrainerV2:
             self.use_pseudo_supervision
             and epoch >= self.align_target_start_epoch
         )
+        val_do_source_align = self.use_source_alignment
         with self._use_ema_student():
             self.model.eval()
             for batch in self.val_loader:
@@ -1642,9 +3293,13 @@ class MTKDTrainerV2:
                 image_paths: List[str] = batch.get("image_paths", [])
                 # Validation uses the eval-mode forward for alignment metrics.
                 # Detection loss is still computed (student in train mode internally).
+                need_teacher_feat = val_do_source_align or (
+                    val_do_target_align and self.use_target_alignment
+                )
                 _, loss_dict = self._forward_and_loss(
                     images, targets, image_paths, epoch,
-                    need_teacher_feat=True, do_source_align=True,
+                    need_teacher_feat=need_teacher_feat,
+                    do_source_align=val_do_source_align,
                     do_target_align=val_do_target_align,
                     images_weak=images_weak,
                     strong_hflip=strong_hflip,
@@ -1655,12 +3310,23 @@ class MTKDTrainerV2:
     def _stage_name(self, epoch: int) -> str:
         """Human-readable training stage for the given epoch index."""
         if epoch < self.align_target_start_epoch:
-            return "source alignment (det + align)"
-        return "full (align + target-align + pseudo-label)"
+            if self.use_source_alignment:
+                return "source alignment (det + align)"
+            return "detection warmup (source align disabled)"
+        if self.use_source_alignment and self.use_target_alignment:
+            return "full (source-align + target-align + pseudo-label)"
+        if self.use_target_alignment:
+            return "full (target-align + pseudo-label)"
+        if self.use_source_alignment:
+            return "full (source-align + pseudo-label)"
+        return "full (pseudo-label only)"
 
     def _log_metrics_breakdown(self, label: str, metrics: Dict[str, float]) -> None:
         """Log a compact loss breakdown for train/val summaries."""
         pseudo_cls = self._format_pseudo_class_counts(metrics)
+        prior_mask = metrics.get("loss_prior_mask", 0.0) + metrics.get("loss_prior_mask_target", 0.0)
+        prior_prop = metrics.get("loss_prior_propagation", 0.0) + metrics.get("loss_prior_propagation_target", 0.0)
+        prior_periodic = metrics.get("loss_prior_periodic", 0.0) + metrics.get("loss_prior_periodic_target", 0.0)
         self.logger.info(
             f"{label:<15} | "
             f"det={metrics.get('loss_det', 0.0):.4f}, "
@@ -1669,6 +3335,12 @@ class MTKDTrainerV2:
             f"det_total={metrics.get('loss_det_total', 0.0):.4f}, "
             f"align={metrics.get('loss_align', 0.0):.4f}, "
             f"align_target={metrics.get('loss_align_target', 0.0):.4f}, "
+            f"gate_distill={metrics.get('loss_student_gate_distill', 0.0):.4f}, "
+            f"gate_mean={metrics.get('student_gate_mask_mean', 0.0):.4f}, "
+            f"gate_target={metrics.get('student_gate_target_mean', 0.0):.4f}, "
+            f"prior_mask={prior_mask:.4f}, "
+            f"prior_prop={prior_prop:.4f}, "
+            f"prior_periodic={prior_periodic:.4f}, "
             f"pseudo_raw={metrics.get('loss_pseudo', 0.0):.4f}, "
             f"pseudo_ultra_img={metrics.get('loss_pseudo_ultra_per_img', metrics.get('loss_pseudo_per_img', 0.0)):.4f}, "
             f"pseudo_weighted={metrics.get('loss_pseudo_weighted', 0.0):.4f}, "
@@ -1829,6 +3501,12 @@ class MTKDTrainerV2:
             )
             self._log_metrics_breakdown("Train breakdown", train_metrics)
             self._log_metrics_breakdown("Val breakdown", val_metrics)
+
+            if self.debug_export_interval > 0 and ((epoch + 1) % self.debug_export_interval == 0):
+                try:
+                    self._export_epoch_debug(epoch + 1)
+                except Exception as exc:
+                    self.logger.warning("Debug export failed at epoch %d: %s", epoch + 1, exc)
 
             current_loss = self._select_current_loss(train_metrics, val_metrics)
             current_score = self._select_current_score(epoch, current_loss)

@@ -1,0 +1,5 @@
+bbox figure
+綠色：原本低於 conf，被 support / freq prior 拉高後通過門檻
+黃色：score 有被提高，但本來不一定是 missing
+洋紅：最後保留下來的正常框
+紅色：被壓低或最後沒過門檻的 proposal
