@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,60 @@ except ImportError:  # pragma: no cover - optional dependency
     yaml = None
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def _configure_report_plot_style() -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "Liberation Serif", "DejaVu Serif"],
+            "font.size": 12,
+            "axes.labelsize": 12,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+
+def _save_completion_box_count_figure(rows: Sequence[Dict[str, object]], output_dir: Path) -> Dict[str, float]:
+    if not rows:
+        return {}
+    before_total = float(sum(float(row.get("before_box_count", 0.0)) for row in rows))
+    after_total = float(sum(float(row.get("after_box_count", 0.0)) for row in rows))
+    added_total = float(
+        sum(
+            max(0.0, float(row.get("after_box_count", 0.0)) - float(row.get("matched_box_count", 0.0)))
+            for row in rows
+        )
+    )
+    _configure_report_plot_style()
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    labels = ["Before Pattern", "Added BBoxes", "After Pattern"]
+    values = [before_total, added_total, after_total]
+    bars = ax.bar(
+        labels,
+        values,
+        color=["#3572A5", "#767676", "#C13B35"],
+        edgecolor="black",
+        linewidth=0.8,
+    )
+    for bar, hatch in zip(bars, ("oo", "xx", "//")):
+        bar.set_hatch(hatch)
+    ax.set_ylabel("Number of Predicted BBoxes")
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.6)
+    ax.set_axisbelow(True)
+    fig.savefig(output_dir / "bbox_counts_before_after.pdf", bbox_inches="tight")
+    fig.savefig(output_dir / "bbox_counts_before_after.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "total_before_box_count": before_total,
+        "total_added_box_count": added_total,
+        "total_after_box_count": after_total,
+        "mean_added_box_count": added_total / max(len(rows), 1),
+    }
 
 
 def _load_config_dict(config_path: str) -> Dict[str, object]:
@@ -3052,6 +3107,7 @@ def run_detect_test(args: argparse.Namespace, device: str, dataset: ImageFolderD
             encoding="utf-8",
         )
 
+    completion_box_counts = _save_completion_box_count_figure(rows, output_dir)
     summary = {
         "num_samples": int(len(rows)),
         "pattern_apply_mode": str(args.pattern_apply_mode),
@@ -3065,7 +3121,10 @@ def run_detect_test(args: argparse.Namespace, device: str, dataset: ImageFolderD
         "mean_synthetic_added_count": float(np.mean([float(r["synthetic_added_count"]) for r in rows])),
         "mean_synthetic_final_count": float(np.mean([float(r["synthetic_final_count"]) for r in rows])),
         "mean_shape_removed_count": float(np.mean([float(r["shape_removed_count"]) for r in rows])),
+        "bbox_counts_before_after_pdf": str(output_dir / "bbox_counts_before_after.pdf"),
+        "bbox_counts_before_after_png": str(output_dir / "bbox_counts_before_after.png"),
     }
+    summary.update(completion_box_counts)
     if predictions_before_path is not None and predictions_after_path is not None:
         summary["predictions_before_json"] = str(predictions_before_path)
         summary["predictions_after_json"] = str(predictions_after_path)
