@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Plot spacing histograms and export Excel-friendly one-column series.
+"""Plot normalized-spacing histograms and export Excel-friendly series.
 
 Run from the repo root:
 
     python outputs/spacing_info/plot_spacing_info.py
 
 This script regenerates histogram PNG/PDF files for every spacing-info
-subdirectory. PDF export uses bbox_inches="tight" for clean vector figures.
+subdirectory. The x-axis is normalized spatial period:
+
+    T_norm = period_norm / median(period_norm)
+
+Thus T_norm = 1 means the species median spacing. This is a linear
+normalization, so the histogram distribution keeps the same shape as the
+original pixel-spacing histogram. PDF export uses bbox_inches="tight" for
+clean vector figures.
 """
 
 from __future__ import annotations
 
 import csv
+import statistics
 from pathlib import Path
 from typing import Iterable
 
@@ -36,19 +44,25 @@ EXPORT_EXCEL_SERIES = True
 PLOTS = [
     {
         "input_csv": "horizontal_spacings.csv",
-        "value_column": "spacing_px",
+        "period_column": "spacing_norm_x",
+        "fallback_period_column": "spacing_px",
         "output_png": "horizontal_spacing_hist.png",
         "output_pdf": "horizontal_spacing_hist.pdf",
-        "output_series_csv": "horizontal_spacing_series_excel.csv",
-        "xlabel": "Spatial Period(pixels)",
+        "extra_output_png": "horizontal_normalized_spacing_hist.png",
+        "extra_output_pdf": "horizontal_normalized_spacing_hist.pdf",
+        "output_series_csv": "horizontal_normalized_spacing_series_excel.csv",
+        "xlabel": "Normalized Spatial Period",
     },
     {
         "input_csv": "vertical_row_gaps.csv",
-        "value_column": "row_gap_px",
+        "period_column": "row_gap_norm_y",
+        "fallback_period_column": "row_gap_px",
         "output_png": "vertical_row_gap_hist.png",
         "output_pdf": "vertical_row_gap_hist.pdf",
-        "output_series_csv": "vertical_row_gap_series_excel.csv",
-        "xlabel": "Spatial Period(pixels)",
+        "extra_output_png": "vertical_normalized_spacing_hist.png",
+        "extra_output_pdf": "vertical_normalized_spacing_hist.pdf",
+        "output_series_csv": "vertical_normalized_spacing_series_excel.csv",
+        "xlabel": "Normalized Spatial Period",
     },
 ]
 
@@ -59,15 +73,30 @@ def iter_spacing_dirs(root: Path) -> Iterable[Path]:
             yield path
 
 
-def load_values(csv_path: Path, value_column: str) -> list[float]:
+def load_values(csv_path: Path, value_column: str, fallback_column: str | None = None) -> list[float]:
     values: list[float] = []
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             try:
                 values.append(float(row[value_column]))
             except (KeyError, TypeError, ValueError):
-                continue
+                if fallback_column is None:
+                    continue
+                try:
+                    values.append(float(row[fallback_column]))
+                except (KeyError, TypeError, ValueError):
+                    continue
     return values
+
+
+def periods_to_normalized_spacing(periods: list[float]) -> list[float]:
+    positive = [v for v in periods if v > 0]
+    if not positive:
+        return []
+    median_period = statistics.median(positive)
+    if median_period <= 0:
+        return []
+    return [v / median_period for v in positive]
 
 
 def export_series_csv(path: Path, values: list[float]) -> None:
@@ -112,7 +141,8 @@ def main() -> None:
             if not csv_path.exists():
                 continue
 
-            values = load_values(csv_path, spec["value_column"])
+            periods = load_values(csv_path, spec["period_column"], spec.get("fallback_period_column"))
+            values = periods_to_normalized_spacing(periods)
             if not values:
                 continue
 
@@ -134,6 +164,14 @@ def main() -> None:
             pdf_path = spacing_dir / spec["output_pdf"]
             fig.savefig(png_path, dpi=DPI)
             fig.savefig(pdf_path, bbox_inches="tight")
+            extra_png = spacing_dir / spec.get("extra_output_png", "")
+            extra_pdf = spacing_dir / spec.get("extra_output_pdf", "")
+            if extra_png.name:
+                fig.savefig(extra_png, dpi=DPI)
+                updated_png.append(extra_png)
+            if extra_pdf.name:
+                fig.savefig(extra_pdf, bbox_inches="tight")
+                updated_pdf.append(extra_pdf)
             plt.close(fig)
             updated_png.append(png_path)
             updated_pdf.append(pdf_path)
